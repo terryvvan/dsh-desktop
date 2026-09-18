@@ -20,6 +20,7 @@ const { spawn, execFile } = require('node:child_process');
 const path = require('node:path');
 const fs = require('node:fs');
 const { createRuntimeManager } = require('./updater');
+const { createBackgroundManager } = require('./background');
 
 const APP_ID = 'ai.deepseek.harness.desktop';
 const APP_TITLE = 'DeepSeek Harness';
@@ -71,6 +72,17 @@ const runtimeManager = createRuntimeManager({
   userDataDir: app.getPath('userData'),
   log,
 });
+
+const backgroundManager = createBackgroundManager({
+  userDataDir: app.getPath('userData'),
+  log,
+  getMainWindow: () => mainWindow,
+  onChange: () => buildMenu(),
+});
+
+// Privileged schemes have to be declared before the app is ready, which is why
+// this cannot wait for the manager to be installed below.
+backgroundManager.registerScheme();
 
 // ─── window state ────────────────────────────────────────────────────────────
 
@@ -404,6 +416,7 @@ function showMainWindow(url) {
     mainWindow = null;
   });
 
+  backgroundManager.attachWindow(mainWindow);
   mainWindow.loadURL(url);
 }
 
@@ -673,6 +686,14 @@ function buildMenu() {
           accelerator: 'F12',
           click: () => mainWindow?.webContents.toggleDevTools(),
         },
+        { type: 'separator' },
+        { label: '背景设置…', click: () => backgroundManager.openSettings() },
+        {
+          label: '清除背景图片',
+          id: 'clear-background',
+          enabled: backgroundManager.hasBackground(),
+          click: () => backgroundManager.clearBackground(),
+        },
       ],
     },
     {
@@ -723,6 +744,7 @@ if (!app.requestSingleInstanceLock()) {
   app.whenReady().then(() => {
     log(`--- ${APP_TITLE} shell ${app.getVersion()} starting ---`);
     runtimeManager.cleanStaging();
+    backgroundManager.install();
     buildMenu();
     if (!preflight()) {
       app.quit();

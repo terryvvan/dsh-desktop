@@ -125,11 +125,33 @@ body[data-ds-dark-theme] {
 
 「在默认浏览器中打开」的页面没有背景是固有限制：那个页面是独立运行的 `dsh web`，由浏览器渲染，桌面外壳无法向它注入样式。这条会写进 README。
 
-## 待实现阶段验证的点
+## 实现阶段验证结果
 
-以下两点无法只靠静态阅读确认，需要在真实界面上验证并按结果调整：
+设计时留下两个只能靠渲染确认的问题，已用独立 Electron 进程加载真实 DSH 页面逐一验证。
 
-1. **哪些令牌真正构成应用画布。** 已确认 `--dsw-alias-bg-base` 出现 26 次、`bg-layer-1` 40 次、`bg-module-platform` 20 次，但应用根容器的背景出自哪个令牌尚未定位。实现的初始覆盖集合是 `bg-base` + `bg-layer-1` + `bg-module-platform`，需要渲染后目视确认是否有遗漏的不透明区域。
-2. **`cover` + `fixed` 在真实页面上的表现**，包括页面存在自身滚动容器时的铺满效果。
+### 1. 构成应用画布的令牌（已确定）
 
-验证方式：独立启动一个 Electron 进程（使用独立的 `userData` 目录，不影响正在运行的实例），加载真实的 DSH 页面并注入样式，用 `webContents.capturePage()` 截图后目视检查。
+初版只覆盖了 `bg-base` + `bg-layer-1` + `bg-module-platform`。截图显示**左侧边栏和输入框在 40% 不透明度下依然接近不透明**。没有靠猜补令牌，而是让渲染进程用 `document.elementFromPoint()` 取到真实元素，再用 `element.matches()` 把元素和 `document.styleSheets` 里的规则对上，直接读出生效的令牌名：
+
+| 区域 | 实际令牌 |
+| --- | --- |
+| 应用画布 | `--dsw-alias-bg-base` |
+| 面板 | `--dsw-alias-bg-layer-1` |
+| 平台模块（工具条等） | `--dsw-alias-bg-module-platform` |
+| **左侧边栏** | `--dsw-specific-sidebar-fill` |
+| **输入框卡片** | `--dsw-specific-input-major` |
+
+最终覆盖集合即为这五个。同时对全部用于背景的令牌做了完整清点（`background` / `background-color` / `background-image` 中出现 `var(--dsw-*)` 的规则），据此明确排除：`bg-layer-2` / `-layer-3` / `specific-menu`（对话框、弹层、菜单）、`interactive-bg-*` / `button-*-fill`（悬停与按钮）、`bg-mask-*`（遮罩）、`markdown-code-block*`（代码块）。理由都写进了 `electron/background.js` 的 `SURFACE_TOKENS` 注释，避免以后有人凭直觉往里加。
+
+### 2. `cover` + `fixed` 的表现（已验证）
+
+用一张 1600×900 的测试图（含正圆、网格、四角标记）在 1264×735 的内容区渲染：圆保持正圆、没有变成椭圆，说明 `cover` 是裁切而非拉伸；四角标记在窗口右上下、以及透过左侧边栏都可见，说明图片铺满整个窗口。滚动与固定定位无异常。
+
+### 3. 深色主题（已验证）
+
+`body` 与 `body[data-ds-dark-theme]` 两条规则都带 `!important`。实测切换主题属性后，面板的计算背景为 `rgba(21, 21, 23, 0.55)`，即深色规则以当前滑块值胜出，浅色规则没有串色。
+
+### 4. 设置窗口与 IPC（已验证）
+
+设置窗口、`contextBridge` 桥接、滑块拖动链路均实测通过：桥接对象存在、初始状态正确往返、拖动滑块后主窗口实时变化、防抖 300ms 后落盘、重复调用 `openSettings()` 不产生第二个窗口、关闭按钮生效。
+
