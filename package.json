@@ -1,0 +1,76 @@
+{
+  "name": "deepseek-harness-desktop",
+  "productName": "DeepSeek Harness",
+  "version": "0.1.5",
+  "description": "Self-contained Windows desktop build of DeepSeek Harness (DSH) 0.1.5-rc.2: an Electron shell around a bundled node.exe + @deepseek-ai/dsh runtime.",
+  "private": true,
+  "author": "DeepSeek Harness desktop build",
+  "license": "MIT",
+  "main": "electron/main.js",
+  "scripts": {
+    "prepare:runtime": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/prepare-runtime.ps1",
+    "make:icon": "node scripts/make-icon.mjs",
+    "test:updater": "node scripts/test-updater.mjs",
+    "test:updater:check": "node scripts/test-updater.mjs --check-only",
+    "start": "electron .",
+    "dist": "electron-builder --win",
+    "dist:nsis": "electron-builder --win nsis",
+    "dist:green": "electron-builder --win zip"
+  },
+  "devDependencies": {
+    "electron": "44.4.2",
+    "electron-builder": "26.15.3"
+  },
+  "build": {
+    "appId": "ai.deepseek.harness.desktop",
+    "productName": "DeepSeek Harness",
+    "artifactName": "DeepSeekHarness-${version}-${arch}.${ext}",
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "files": [
+      "electron/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "runtime",
+        "to": "runtime"
+      }
+    ],
+    "asar": true,
+    "npmRebuild": false,
+    "nodeGypRebuild": false,
+    "electronDist": "node_modules/electron/dist",
+    "win": {
+      "icon": "build/icon.ico",
+      "executableName": "DeepSeekHarness",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowElevation": true,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "DeepSeek Harness",
+      "deleteAppDataOnUninstall": false,
+      "artifactName": "DeepSeekHarness-Setup-${version}.${ext}"
+    }
+  }
+}

@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; style-src 'unsafe-inline'; img-src 'self'"
+    />
+    <title>DeepSeek Harness</title>
+    <style>
+      * { box-sizing: border-box; }
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: radial-gradient(120% 100% at 50% 0%, #24262c 0%, #17181b 70%);
+        color: #eceef2;
+        font: 14px/1.7 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+        user-select: none;
+        overflow: hidden;
+      }
+      body {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        -webkit-app-region: drag;
+        border: 1px solid #33363d;
+        border-radius: 10px;
+      }
+      .mark {
+        width: 58px;
+        height: 58px;
+        display: grid;
+        place-items: center;
+        border-radius: 15px;
+        background: linear-gradient(135deg, #5a78ff 0%, #2b47d6 100%);
+        box-shadow: 0 8px 24px rgba(77, 107, 254, 0.3);
+        margin-bottom: 18px;
+      }
+      .mark img {
+        width: 36px;
+        height: 36px;
+        filter: brightness(0) invert(1);
+      }
+      h1 { margin: 0; font-size: 16px; font-weight: 600; letter-spacing: 0.2px; }
+      p { margin: 6px 0 0; font-size: 12.5px; color: #9aa0ad; }
+      .bar {
+        position: relative;
+        width: 208px;
+        height: 3px;
+        margin-top: 22px;
+        border-radius: 3px;
+        background: #2c2f36;
+        overflow: hidden;
+      }
+      .bar::after {
+        content: "";
+        position: absolute;
+        inset: 0;
+        width: 40%;
+        border-radius: 3px;
+        background: linear-gradient(90deg, transparent, #4d6bfe, transparent);
+        animation: slide 1.25s ease-in-out infinite;
+      }
+      @keyframes slide {
+        0% { transform: translateX(-110%); }
+        100% { transform: translateX(310%); }
+      }
+      .hint { position: absolute; bottom: 14px; font-size: 11px; color: #5f6673; }
+    </style>
+  </head>
+  <body>
+    <div class="mark"><img src="logo.svg" alt="" /></div>
+    <h1>DeepSeek Harness</h1>
+    <p>正在启动本地内核并挂载界面…</p>
+    <div class="bar"></div>
+    <div class="hint">首次启动需要引导插件树，可能耗时数十秒</div>
+  </body>
+</html>

@@ -1,0 +1,7 @@
+node_modules/
+dist/
+runtime/
+build/icon.png
+build/icon.svg
+build/icon.ico
+.updater-test/
