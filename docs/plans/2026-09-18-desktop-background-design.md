@@ -225,4 +225,213 @@ body[data-ds-dark-theme] {
 
 对照图见 `docs/images/background/`：`before.jpg`（v1，浅色主题 + 25% 面板）、`after-dark-low.jpg`、`after-dark-default.jpg`（默认参数）、`after-conversation.jpg`、`settings.jpg`（v2 设置窗口）。
 
+---
+
+## v3 修订：背景支持动图与视频
+
+日期：2026-09-20
+状态：已实现；动图沿用 v1 路径，视频链路已逐项渲染验证（见下）
+
+需求是「让背景图片支持视频或动图」。两件事的性质完全不同，处理方式也不同。
+
+### 1. 动图不需要新代码，只需要写进说法里
+
+GIF、动态 WebP、动态 AVIF、APNG 都由浏览器自己在 `background-image` 里播放。v1 的扩展名列表里本来就有 `gif`，所以这类文件一直能用，只是文档和界面从没提过，用户不会想到可以选。v3 把 `apng` 补进列表，并在设置窗口和 README 里说明。
+
+### 2. 视频必须换一种画法
+
+CSS 没有播放视频的能力，`background-image` 做不到，所以视频需要一个 `<video>` 元素。这带来一个**连带的必要改动**：v1 把背景画在 `body` 上，而 `body` 的背景画在画布层，任何 `z-index: -1` 的元素都在它**上面**——也就是说，一旦引入元素，压暗的黑色蒙版就会盖在元素下面、跑到画面背后去。
+
+所以两种模式统一到一个固定在窗口底层的元素 `#dshbg-video` 上：
+
+```css
+#dshbg-video {
+  position: fixed; inset: 0; z-index: -1; overflow: hidden;
+  background-image: linear-gradient(rgba(0,0,0,DIM), rgba(0,0,0,DIM)), url("dshbg://bg/current?v=…");
+  background-size: cover; background-position: center; background-attachment: fixed;
+}
+#dshbg-video > video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+```
+
+- 图片与动图：图直接画在这一层上（它自己的背景），行为与 v1 等价——`body` 不再画任何东西。
+- 视频：这一层只留蒙版，画面由子元素 `<video>` 提供。
+- 两种模式下蒙版都在画面之上、应用之下。这一条在验证时确认过（见下表）。
+
+### 3. 视频的其余决定
+
+- **静音、循环、`playsinline` 必须在 `play()` 之前设好**：浏览器拒绝在未静音元素上自动播放，而 `muted` 在调用之后才设已经太晚。
+- **协议要支持字节范围。** `<video>` 靠范围请求探测容器并定位，永远回 200 加整个文件会让它每次请求都从头下载——循环播放时等于一直在重下。协议处理器现在解析 `Range`，回 `206` + `Content-Range` + `Accept-Ranges`，并给响应加上 `immutable` 缓存头（URL 里带内容摘要，同一个 URL 的内容永不改变）。
+- **换文件的判定不能只看 `video.src`。** `HTMLMediaElement.src` 会被页面解析成绝对 URL，比较它认不出两个版本；摘要同时写在元素的 `data-rev` 上，那个值永远是外壳写进去的东西。
+- **拖动滑块不重建播放器。** 样式表每次都整体替换，元素则只在需要时创建，所以调不透明度、压暗、配色都不会让视频从头开始。为此不需要另设一条 `playback` 通道——把 `playback` 与 `speed` 一起放进同一次设置更新即可。
+- **视频无法自动测光。** `nativeImage` 只解静态图，所以视频固定按深色处理，并在设置窗口的配色提示里写明。这顺带修掉一个真 bug：阈值判断原是 `luminance < 0.5`，而视频的占位亮度正好是 `0.5`，于是落到了「浅色」——半透明白色压在未知动态画面上正是最难认的一种。改成 `<=`。
+- **窗口不可见时暂停**是可选开关。Chromium 会在页面转为不可见时自行暂停后台视频，恢复时不会接着播，所以外壳在窗口 `restore` / `focus` 时重新确认播放状态；反过来，如果用户没开这个开关，就由外壳显式恢复。
+- **设置窗口固定尺寸，卡片区滚动。** 视频卡片只在选了视频时出现，所以最初的做法是量内容高度再把窗口贴合上去。这是一条彻底的弯路，连着两个 bug：
+
+  1. **高度不能用 `scrollHeight` 量。** 元素的 `scrollHeight` 永远不小于它自己的盒子，而 `body` 和窗口一样高，于是 `document.body.scrollHeight` 返回的是**窗口**（还要再加上 body 的 padding）。把它当内容高度喂回去就是正反馈——而重新贴合在每次设置变化时都会跑，所以拖动一次透明度滑块会让窗口一路长高往屏幕下爬（实测每次 +18px）。
+  2. 改用「自然高度」（各子元素叠加 + 间距 + padding）后高度稳定了，但**窗口宽度仍会参与**：贴合时读回当前宽度再写回，而这个读回值并不总是等于写回去的那个值，于是窗口宽度会漂（1.5 倍缩放下实测内容在 908/890 之间重排）。
+
+  更根本的是**这条路在用户的机器上根本走不通**：显示器是 1707×1067、缩放 150%，工作区只有约 711 个逻辑像素高，比卡片实际需要的（约 830）还少。也就是说无论怎么量，窗口都不可能既装下全部卡片、又留在屏幕内——旧实现只按工作区高度夹紧，从未考虑窗口自身的 y 坐标，所以它总是往屏幕下缘跑。
+
+  **结论是这类窗口不该有自己的尺寸状态。** 现在：窗口尺寸在创建时定死（内容 640），**卡片区（`main`）自己滚动**，页脚放在滚动区之外因而始终可见。不读回、不写回、不重排，也就没有可漂的东西；小屏上滚动条承担高度不足，页脚按钮始终够得着。`fitSettingsWindow`、`dshbg:resize`、`preload.resize()` 这一整条链路连同 `screen` 依赖都已删除，窗口改为居中打开。
+
+  回归验证用 `PREVIEW_RESIZE_REPEAT`（新增）：连做 10 次设置更新、再拖动窗口、再做 10 次，把每一步的窗口尺寸打出来，必须一模一样。现在两种状态都是 `width=456`、`height=606` 全程不变，且 `footerVisible: true`。实测窗口移动后 Windows 会把非客户区边框重新算一次（内容视口偶尔在 606/608 之间），这是窗口框架自身的行为。
+
+### 验证方式与结果
+
+预览脚本扩了这些能力：`PREVIEW_FRAMES` / `PREVIEW_FRAME_GAP` 连拍多帧并逐字节比对（判断背景是否真的在动）、`PREVIEW_VIDEO` 把一个真实视频文件按选图的方式装进设置目录、`PREVIEW_RESIZE_REPEAT` 连做设置更新与拖动以验证窗口尺寸不漂、`PREVIEW_DRAG_BY` 用真实鼠标拖标题栏、`PREVIEW_LOG` 把每行同时写进文件（`app.exit()` 不刷新 stdout，最后几行本来会丢）。
+
+| 检查项 | 结果 |
+| --- | --- |
+| 图片背景（回归） | 截图与 v1 基线**逐字节相同**（`digest=e404bef3c538`）；`_fade`、`_composerSeat` 仍为 `none`；配色仍为深色 |
+| 底层元素 | `#dshbg-video` 存在，`position: fixed`、`z-index: -1`，`background-image` = 蒙版 + `url("dshbg://bg/current?v=4f5b1f81c2a3")`；`body` 背景为 `none` |
+| 视频背景（真实文件） | `<video>` 的 `src` = `dshbg://bg/current`、`data-rev` = 内容摘要、`loop`/`muted`/`playbackRate` 与设置一致、`object-fit: cover`；**`paused: false`、`readyState: 4`、`width: 2560`、`height: 1440`、`duration: 5`、`currentTime` 持续推进、`error: null`**——真实解码、播放、循环均确认 |
+| 协议范围请求 | 处理器收到 `range=bytes=0-` 并按 `206` 切片作答（日志确认） |
+| 设置窗口尺寸 | 固定 `456×606`；10 次设置更新 + 真实鼠标拖动 + 再 10 次更新后 `widthStable=yes heightStable=yes`（真实视频配置下同样成立） |
+| 设置窗口滚动 | 卡片区 `scrollable: true`（`scrollHeight 833` / `clientHeight 539`），页脚 `footerVisible: true` |
+| 连拍比对 | 图片背景 `changed = 0.00 B/px`（静止，符合预期） |
+
+### 关于视频素材
+
+一开始想在仓库里造一个测试视频，三条路都不通：手写 VP8 关键帧（容器结构正确，Chromium 仍以 `MEDIA_ERR_SRC_NOT_SUPPORTED` 拒绝——码流不是能靠常量拼出来的）、MediaRecorder（隐藏窗口不驱动合成器，`captureStream` 不出帧，脚本卡死）、Windows Media Foundation 的 H.264 编码器（`AddStream` 返回 `MF_E_INVALIDMEDIATYPE`，没找到合适的输出类型）；AVI 容器也确认不在 Electron 自带 ffmpeg 的支持列表内。这些尝试已全部删除，仓库不再带任何合成的「测试视频」。
+
+改法是让预览直接用**用户自己的文件**：`PREVIEW_VIDEO=<某个 mp4/webm>` 会把它按选图的方式装进设置目录再跑完整链路；不指定时预览默认读真实的用户数据目录，所以它会直接反映当前配置——上面那行视频结论就是这么来的。播不动时页面会给出 `<video>` 的 `error` 与 `readyState`。
+
+---
+
+## v4 修订：菜单栏也铺上背景
+
+日期：2026-09-20
+状态：已实现并渲染验证
+
+需求是「背景能不能铺到菜单栏」。
+
+### 先分清两件事
+
+- **标题栏**（`DeepSeek Harness` + 最小化/关闭按钮）是 Windows 窗口框架画的非客户区，页面背景**没有**任何办法铺过去。唯一的做法是无边框窗口（`frame: false`）加自制窗口按钮，会丢掉系统原生窗口行为（贴边、双击最大化、Aero Snap、系统菜单）。这一条在 README 里写明为固有限制。
+- **菜单栏**（`Menu.setApplicationMenu` 设的四项）在 Windows 上同样是原生控件，用 Windows 的窗口样式绘制，Electron 没有让它背景透明的 API——`setBackgroundColor('#00000000')` 对非客户区无效，实测设了也没用。
+
+所以只有三条路：保持原生（背景铺不过去）、自动隐藏（平时不占位，但菜单要按 Alt 才出来）、**在页面里重做一条**。最后选了第三条。
+
+### 做法：一份定义，两条菜单
+
+原来的菜单是在 `main.js` 里直接写 Electron template。现在改成先构造**纯数据**（`electron/desktop-menu.js` 的 `buildMenuData`），再由它生成两边：
+
+- `toTemplate` 把数据转成 Electron template，交给 `Menu.setApplicationMenu`；
+- `drawFunction` 把同一份数据渲染成页面里的 HTML 菜单栏。
+
+加一个菜单项因此只需要改一处，不会出现「原生菜单有、页面菜单没有」。`role` 项（撤销/复制/粘贴/缩放/全屏/退出）仍然交给 Electron，原生菜单保留它们的实现与快捷键。
+
+**原生菜单栏是隐藏而不是移除**：`win.setMenuBarVisibility(false)`。应用菜单仍然存在，因此 F5、F12、Ctrl+C、Alt+F4 这些快捷键一个都不丢——这是隐藏方案能成立的关键。`视图 → 使用系统菜单栏` 把原生条换回来、把页面条摘掉，选择记在 `%APPDATA%\DeepSeek Harness\menu-state.json`。
+
+### 页面菜单栏的几个实现要点
+
+- **挂在 `<html>`，不是 `<body>`。** 第一版挂在 body 上，结果菜单栏在预览里时有时无：body 的子节点归 DSH 自己的框架所有，它 reconcile 时会把外来节点清掉。`<html>` 只有页面自己会动。
+- **应用整体下移 28px**（`body { padding-top: 28px !important }`），所以这条栏是真正的顶栏，而不是压住应用自己头部的浮层。
+- **半透明靠真正的 alpha，不靠 `backdrop-filter`。** 给这条栏加 `backdrop-filter: blur()` 反而让它变成一条纯黑横条——根级 fixed 元素上的 filter 是与文档而不是与身后的画面合成；同一份样式的下拉面板（嵌套元素，合成路径不同）却能正常透出壁纸。改成 `rgba(26,27,31,0.30)` 这样的真半透明色调后就对了。
+- **点击怎么回到主进程。** 主窗口的设计是**不挂载 preload、不暴露 IPC**，这个约束不为菜单破例。注入的菜单只往自己的控制台写一行 `dshbg-menu: run <id>`，主进程监听这个前缀。这是单向纯文本通道，只能点名菜单定义里已有的 id——比开一条 IPC 桥小得多：插件本来就能 `console.log`，而它能做到的最坏情况只是触发一个用户本来就能点的菜单项。
+
+### 验证方式与结果
+
+预览脚本新增 `PREVIEW_MENU`（`page` / `native`）与 `PREVIEW_MENU_CLICK`，用一份替身定义把菜单栏装进真实 DSH 页面：
+
+| 检查项 | 结果 |
+| --- | --- |
+| 菜单栏存在与布局 | `barPresent: true`、`barHeight: 28`、`position: fixed`、`bodyPaddingTop: 28px`（应用下移，不被遮住） |
+| 透明度 | 栏的计算背景 = `rgba(26, 27, 31, 0.3)`；**同一份页面在深色壁纸上栏偏暗、在浅色壁纸上栏偏亮**（两次渲染裁剪对比），证明确实透出画面而不是画自己的底色 |
+| 下拉面板 | 展开后 `top: 28`、宽 261，首项为禁用信息行、可点项 `enabled: true` |
+| 点击回传 | 点「背景设置…」→ 主进程收到 `["background-settings"]` |
+| 换回原生 | `PREVIEW_MENU=native` → `barPresent: false`、`bodyPaddingTop: 0px` |
+
+顺带修掉一个只有渲染才看得见的坑：注入脚本一开始总是失败，而 `executeJavaScript` 只回一句「Script failed to execute」，原因被丢在没人看的渲染进程控制台里。根因是注入字符串里有一处 `${BAR_HEIGHT}` 没转义——内层模板字面量在页面作用域里去找同名变量，于是 `BAR_HEIGHT is not defined`。修法是把注入脚本写成函数表达式，由调用方套一层 try/catch 把异常当返回值带回来，这类错误以后会直接出现在日志里。
+
+### 实机反馈：菜单不见了，顶上多出一截空白
+
+第一次打包后的反馈是「我菜单呢？」外加「背景上面空出来一截」。两者是同一个原因。
+
+预览里一切正常（`barPresent: true`、`topmostAtBar: DIV.top`），差别在**时机**：`dom-ready` / `did-finish-load` 触发时应用还在启动，DSH 启动完成后重建自己的根节点，把外来节点一起带走。菜单栏是 `<html>` 的**子元素**，于是被删掉；而「下移 28px」是写在 `<head>` 里一条 `<style>`，它活了下来——所以最后看到的是**一条 28px 的空白和它上面的壁纸**，菜单栏本体已经不在 DOM 里了。
+
+修法是不再假设「画一次就够了」：
+
+- 安装时在 500 / 1500 / 3000 / 6000ms 各补画一次，覆盖启动结束后那段 DOM 还在动的窗口；
+- 画成功之后在页面里装一个 `MutationObserver`（监听 `documentElement` 的 `childList`，`subtree` 也开），一旦发现菜单栏不在而样式还在，就通过既有的控制台通道请求主进程重画——重画必须由主进程做，因为只有它手里有菜单定义；
+- 切回原生菜单时把观察者的钩子一并撤掉（`delete window.__dshbgMenuRedraw` 并清掉样式），否则它会立刻把菜单栏又画回来。
+
+`PREVIEW_MENU=page` 里加了一条针对性的用例：**把菜单栏从 DOM 里删掉，等 900ms，要求它自己回来**。
+
+| 检查项 | 结果 |
+| --- | --- |
+| 被删除后自愈 | `wipe=wiped` → `restore={"restored":true,"height":28,"padding":"28px"}` |
+| 自愈后仍可用 | 自愈之后再点「背景设置…」→ 主进程收到 `["background-settings"]` |
+
+教训记在这里：**在别人的页面里注入东西，「插进去」不等于「留在那里」**。凡是跨越应用启动期的注入，都要么等到应用稳定之后再插，要么能自己发现被删并补回来。
+
+### 第二次实机反馈：菜单还是没有，而且主界面多了滚动条
+
+反馈两条：「菜单依旧未生效」、「主界面出现了滚动条，导致设置按钮被裁」。
+
+**菜单没生效的原因不在注入，而在接线。** 应用日志里写得很清楚（这正是上一轮加日志的价值）：
+
+```
+menu: bar injection said error: MENUS is not iterable
+```
+
+`main.js` 里传给 `createDesktopMenu` 的 `getMenu` 写成了 `() => ({ ...menuContext(), pageMenu })`——`menuContext()` 是 `buildMenuData` 的**输入**而不是输出，于是 `menu.data` 是 `undefined`，注入脚本自然无法遍历。
+
+**为什么预览没抓到？** 因为预览当时用的是一份**替身菜单定义**，直接构造 `{ data, commands }` 传进去，把 `getMenu` 这一环整个绕过去了。替身让「画得出来」和「接线正确」这两件事分开了，而后者才是实机上唯一会错的地方。修法有两步：
+
+1. 预览改为用**壳自己的定义**——`buildMenuData(previewMenuContext())`，并按 `showMainWindow` 的方式接线（连原生模板也一并生成，模板不合法会在启动时直接崩）；
+2. `refresh()` 改成 `async` 并把注入结果**返回**出来，测试可以直接断言 `'ok'`，而不是只从日志里捞。
+
+顺带查出一个更底层的 bug：注入脚本里的 CSS 注释用到了反引号，而整段脚本本身就活在一个模板字面量里——**一个反引号就把模板提前闭合了**，于是整段注入代码语法错误。这类错误在页面里只表现为「Script failed to execute」，症状看起来和上面那个接线错误一模一样。两个都修了：注释里不许出现反引号（并在注释里写明原因），同时保留 `scripts/dump-menu-script.cjs` 那种「把注入脚本落盘再用 `vm.Script` 解析」的排查手段。
+
+**滚动条是「下移 28px」带来的副作用。** 页面是 `height: 100%`，给 `body` 加 `padding-top` 是在盒外再加 28px，于是整页比窗口高；而 `html` 上有 `overflow: hidden`，浏览器无法滚动 html，就把滚动容器挪到了 `body` 上——结果主界面自己滚起来，底部那排（设置按钮）被推到看不见的地方。修法是 `box-sizing: border-box`，让这 28px 从盒内让出来，页面仍然恰好一个窗口高。代价是应用可用高度少了 28px（这是「菜单栏占一条」的必然结果，不是 bug）。
+
+预览的菜单探针因此也补了这两项断言：
+
+| 检查项 | 结果 |
+| --- | --- |
+| 用真实定义渲染 | `topLabels = ["文件","编辑","视图","帮助"]`（四个菜单全部出现） |
+| 不产生滚动条 | `bodyScrolls: false`、`htmlScrolls: false`、`bodyClient == windowInner == 794` |
+| 底部不被裁 | `bottomMost: { bottom: 794, insideViewport: true }` |
+| 盒模型 | `bodyBoxSizing: "border-box"` |
+
+---
+
+## v5 修订：关闭设置弹窗后应用掉到别的软件后面
+
+日期：2026-09-20
+状态：已修（模态子窗口 + 显式交还前台）
+
+反馈是「关闭背景弹窗的时候会直接隐藏主界面」。先在预览里按各种路径复现都复现不出来：主窗口从不隐藏、也不最小化（42 次采样 `hidden: 0`），连最大化状态都试过。直到**直接监视用户正在运行的那个应用**，才看清真实情况——不是隐藏，是**前台丢了**：
+
+```
+line 555  other:DeepSeek Harness      ← 设置弹窗在前台
+line 561  other:背景设置              ← 用户点了关闭
+line 571  other:DeepSeek Harness      ← 应用整体失去前台（主窗口仍 visible、未最小化）
+line 580  APP-FOREGROUND              ← 约 5 秒后才回到前台
+```
+
+也就是说：点关闭后，前台被交给了「之前在最前面的那个窗口」（这里是 Chrome），于是整套界面看起来像被最小化、跳到了别的软件。主窗口从头到尾都 visible、也没 minimized——**「看起来不见了」和「真的被隐藏」是两回事**，`isVisible()` 看不到这个现象，`GetForegroundWindow` 才能。
+
+### 原因
+
+设置窗口当时是一个普通子窗口（`parent: main`）。子窗口关闭时，前台交还给谁由系统按 Z 序决定：**Windows 不会把激活交给一个当前不在前台的进程**，所以外壳只能等——实测那 5 秒就是这么来的。
+
+### 修法
+
+1. **改成模态子窗口**（`modal: true`）。设置对话框本来就该是模态的，而且模态时由系统负责把前台还给所有者窗口，不再靠运气。
+2. 关闭回调里补一次显式的交还：`mainWindow.moveTop()` + `focus()`（跳过已最小化的情况）。模态已经把这件事做对了，这一步是兜底——复现不了的问题，宁可多留一手。
+
+### 验证
+
+预览新增 `PREVIEW_CLOSE_SETTINGS` 场景：加载真实页面 → 显示主窗口（可选最大化）→ 打开设置 → 切换一次背景（用户的复现前提）→ 关闭 → 全程用 `GetForegroundWindow` 采样，只有状态变化才记录。
+
+| 检查项 | 结果 |
+| --- | --- |
+| 前台归属 | `f=1 → f=0 → f=1`，且首尾 `fg` 是同一个窗口句柄（回到主窗口） |
+| 主窗口状态 | 结束仍 `visible=true minimized=false maximized=true`，前台已回 |
+| 窗口数量 | 2 → 1（设置窗口正常销毁） |
+
+教训：**「窗口看起来不见了」要先分清楚是隐藏、最小化、还是丢前台**。前两个 `isVisible()` / `isMinimized()` 能测，第三个必须问操作系统要 `GetForegroundWindow`；在合成环境里复现不出来时，直接监视用户那台机器上的真实进程比继续加测试用例更快。
+
 

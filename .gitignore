@@ -8,5 +8,6 @@ build/icon.ico
 .updater-test/
 .preview-dsh-home/
 .preview-userdata/
+.preview-settings/
 shot.png
 .test-profile-guard/

@@ -21,6 +21,7 @@ const path = require('node:path');
 const fs = require('node:fs');
 const { createRuntimeManager } = require('./updater');
 const { createBackgroundManager } = require('./background');
+const { createDesktopMenu, buildMenuData, toTemplate } = require('./desktop-menu');
 const { createProfileGuard } = require('./profile-guard');
 
 const APP_ID = 'ai.deepseek.harness.desktop';
@@ -43,6 +44,8 @@ const bundleRoot = app.isPackaged ? process.resourcesPath : path.join(__dirname,
 const logDir = path.join(app.getPath('userData'), 'logs');
 const logFile = path.join(logDir, 'desktop.log');
 const stateFile = path.join(app.getPath('userData'), 'window-state.json');
+/** Which menu bar the user chose: the page's own, or the system one. */
+const menuStateFile = path.join(app.getPath('userData'), 'menu-state.json');
 
 // ─── state ───────────────────────────────────────────────────────────────────
 
@@ -67,9 +70,45 @@ let startupCheckStarted = false;
 let configRecoveryStage = 0;
 /** True once third-party bundles were disabled to get the app running again. */
 let safeModeActive = false;
+/**
+ * Whether the menu bar is drawn inside the page (the default, so the background
+ * runs behind it) or left to the system. The system menu is still registered
+ * either way — it is what owns the accelerators — but its bar is hidden while
+ * this is true. See `electron/desktop-menu.js`.
+ */
+let pageMenuBar = readMenuState();
+/** The in-page menu bar, installed on the main window once it exists. */
+let desktopMenu = null;
 /** Boot-phase kernel output, used to name the plugin that broke the boot. */
 const kernelOutput = [];
 const exitWaiters = [];
+
+// ─── menu bar preference ─────────────────────────────────────────────────────
+
+/**
+ * Which menu bar to draw. The in-page one is the default because the background
+ * is painted by the page: a system menu bar is window chrome, and on Windows its
+ * fill cannot be made transparent, so it would always be an opaque strip above
+ * the wallpaper.
+ * @returns {boolean} true to draw the menu inside the page.
+ */
+function readMenuState() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(menuStateFile, 'utf8'));
+    // Default to the page menu: an absent or unreadable file means "not chosen".
+    return parsed.pageMenu !== false;
+  } catch {
+    return true;
+  }
+}
+
+function writeMenuState() {
+  try {
+    fs.writeFileSync(menuStateFile, `${JSON.stringify({ pageMenu: pageMenuBar }, null, 2)}\n`, 'utf8');
+  } catch (error) {
+    log(`menu: failed to save the menu bar choice: ${error.message}`);
+  }
+}
 
 // ─── logging ─────────────────────────────────────────────────────────────────
 
@@ -678,6 +717,9 @@ function showMainWindow(url) {
     // The wallpaper's own mean colour while configured, so the first paint
     // blends into the image instead of flashing the shell's dark chrome.
     backgroundColor: backgroundManager.windowBackground(),
+    // Hidden rather than absent: the application menu still owns every
+    // accelerator, and the visible bar is drawn inside the page so that the
+    // background runs behind it. `视图 → 使用系统菜单栏` brings this one back.
     autoHideMenuBar: false,
     webPreferences: {
       contextIsolation: true,
@@ -686,6 +728,20 @@ function showMainWindow(url) {
       spellcheck: false,
     },
   });
+
+  mainWindow.setMenuBarVisibility(!pageMenuBar);
+  desktopMenu = createDesktopMenu({
+    contents: mainWindow.webContents,
+    // Built fresh on every draw, like `buildMenu` does, because several labels
+    // and enabled states are read live. Note this passes the *built menu*: the
+    // context object is `buildMenuData`'s input, not its output, and handing
+    // that over instead is what left the page bar undefined — the app log said
+    // "menu: bar injection said error: MENUS is not iterable".
+    getMenu: () => ({ ...buildMenuData(menuContext()), pageMenu: pageMenuBar }),
+    setChannel: (name) => void setChannel(name),
+    log,
+  });
+  desktopMenu.install();
 
   mainWindow.once('ready-to-show', () => {
     closeSplash();
@@ -902,137 +958,78 @@ function doRollback() {
 
 // ─── menu ────────────────────────────────────────────────────────────────────
 
-function buildMenu() {
-  const described = runtimeManager.describe();
-  const channelItems = runtimeManager.CHANNELS.map((name) => ({
-    label: name === 'next' ? 'next（稳态预发布）' : name === 'alpha' ? 'alpha（跟随 master）' : 'latest',
-    type: 'radio',
-    checked: described.channel === name,
-    click: () => void setChannel(name),
-  }));
+/**
+ * Everything the menu definition needs from the shell.
+ *
+ * Kept in one function so the native menu and the page's own bar cannot be built
+ * from different state — they are two renderings of the same definition, and
+ * `buildMenuData` is called fresh each time so live labels and enabled states
+ * (the update channel, the snapshot description, whether a background is set)
+ * are current in both.
+ */
+function menuContext() {
+  return {
+    runtimeManager,
+    profileGuard,
+    backgroundManager,
+    appUrl: () => appUrl,
+    mainWindow: () => mainWindow,
+    nativeMenuBar: () => !pageMenuBar,
+    setNativeMenuBar: (useNative) => {
+      pageMenuBar = !useNative;
+      writeMenuState();
+      buildMenu();
+    },
+    dshHome,
+    logDir,
+    restartRuntime,
+    setChannel,
+    manualProfileRollback,
+    manualCheck,
+    doRollback,
+    showAbout,
+    rebuildMenu: () => buildMenu(),
+  };
+}
 
-  const template = [
-    {
-      label: '文件(&F)',
-      submenu: [
-        {
-          label: `当前 DSH ${described.active ?? '未知'} · ${described.source === 'bundled' ? '内置' : '已安装'}`,
-          enabled: false,
-        },
-        { type: 'separator' },
-        { label: '重新加载界面', accelerator: 'F5', click: () => mainWindow?.reload() },
-        {
-          label: '在默认浏览器中打开',
-          id: 'open-in-browser',
-          enabled: appUrl !== null,
-          click: () => {
-            if (appUrl !== null) shell.openExternal(appUrl).catch(() => {});
-          },
-        },
-        {
-          label: '重启 DSH 内核',
-          click: () => {
-            void restartRuntime();
-          },
-        },
-        { type: 'separator' },
-        { label: profileGuard.describeSnapshot(), enabled: false },
-        {
-          label: '回退到上次可用配置',
-          id: 'rollback-profile',
-          enabled: profileGuard.hasSnapshot(),
-          click: () => void manualProfileRollback(),
-        },
-        { type: 'separator' },
-        { label: '检查更新…', id: 'check-updates', click: () => void manualCheck() },
-        { label: '更新通道', submenu: channelItems },
-        {
-          label: described.previous === null ? '回退到上一版本' : `回退到 DSH ${described.previous}`,
-          id: 'rollback',
-          enabled: described.previous !== null,
-          click: () => doRollback(),
-        },
-        {
-          label: '恢复为内置运行时',
-          id: 'use-bundled',
-          enabled: described.source !== 'bundled',
-          click: () => {
-            runtimeManager.writeState({ activeVersion: null, previousVersion: null });
-            buildMenu();
-            void restartRuntime();
-          },
-        },
-        { type: 'separator' },
-        { label: `打开配置目录 (${dshHome()})`, click: () => shell.openPath(dshHome()).catch(() => {}) },
-        { label: '打开配置备份目录', click: () => shell.openPath(profileGuard.backupRoot()).catch(() => {}) },
-        { label: '打开日志目录', click: () => shell.openPath(logDir).catch(() => {}) },
-        { type: 'separator' },
-        { label: '退出', accelerator: 'Alt+F4', role: 'quit' },
-      ],
-    },
-    {
-      label: '编辑(&E)',
-      submenu: [
-        { label: '撤销', role: 'undo' },
-        { label: '重做', role: 'redo' },
-        { type: 'separator' },
-        { label: '剪切', role: 'cut' },
-        { label: '复制', role: 'copy' },
-        { label: '粘贴', role: 'paste' },
-        { label: '全选', role: 'selectAll' },
-      ],
-    },
-    {
-      label: '视图(&V)',
-      submenu: [
-        { label: '实际大小', role: 'resetZoom' },
-        { label: '放大', role: 'zoomIn' },
-        { label: '缩小', role: 'zoomOut' },
-        { type: 'separator' },
-        { label: '全屏', role: 'togglefullscreen' },
-        {
-          label: '开发者工具',
-          accelerator: 'F12',
-          click: () => mainWindow?.webContents.toggleDevTools(),
-        },
-        { type: 'separator' },
-        { label: '背景设置…', click: () => backgroundManager.openSettings() },
-        {
-          label: '清除背景图片',
-          id: 'clear-background',
-          enabled: backgroundManager.hasBackground(),
-          click: () => backgroundManager.clearBackground(),
-        },
-      ],
-    },
-    {
-      label: '帮助(&H)',
-      submenu: [
-        {
-          label: '关于 DeepSeek Harness',
-          click: () => {
-            const info = runtimeManager.describe();
-            dialog.showMessageBox(mainWindow ?? undefined, {
-              type: 'info',
-              title: `关于 ${APP_TITLE}`,
-              message: APP_TITLE,
-              detail:
-                `桌面外壳 ${app.getVersion()}（Electron ${process.versions.electron}）\n` +
-                `当前 DSH ${info.active ?? '未知'}（${info.source === 'bundled' ? '内置运行时' : '已安装更新'}）\n` +
-                `内置 DSH ${info.bundled ?? '未知'}\n` +
-                `更新通道 ${info.channel}${info.previous === null ? '' : ` · 上一版本 ${info.previous}`}\n` +
-                `已安装版本 ${info.installed.length === 0 ? '（无）' : info.installed.join(', ')}\n` +
-                `上次检查 ${info.lastCheck ?? '从未'}\n\n` +
-                `配置目录 ${dshHome()}\n` +
-                `日志 ${logFile}`,
-              buttons: ['好的'],
-            });
-          },
-        },
-      ],
-    },
-  ];
-  Menu.setApplicationMenu(Menu.buildFromTemplate(template));
+/**
+ * Build the menu once and use it for both bars.
+ *
+ * `buildMenuData` is the single definition; the native menu is generated from it
+ * with `toTemplate`, and the page's own bar is drawn from the same data by
+ * `electron/desktop-menu.js`. Adding an item in one place therefore reaches both
+ * — there is no second list to forget.
+ */
+function buildMenu() {
+  const menu = buildMenuData(menuContext());
+
+  Menu.setApplicationMenu(Menu.buildFromTemplate(toTemplate(menu.data, menu.commands)));
+  // Hidden, never removed: the application menu is what still owns every
+  // accelerator (F5, F12, Ctrl+C, Alt+F4), so hiding the bar costs no shortcuts.
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (!win.isDestroyed()) win.setMenuBarVisibility(!pageMenuBar);
+  }
+  desktopMenu?.refresh();
+}
+
+/** The About box, kept out of the menu definition so it stays readable. */
+function showAbout() {
+  const info = runtimeManager.describe();
+  dialog.showMessageBox(mainWindow ?? undefined, {
+    type: 'info',
+    title: `关于 ${APP_TITLE}`,
+    message: APP_TITLE,
+    detail:
+      `桌面外壳 ${app.getVersion()}（Electron ${process.versions.electron}）\n` +
+      `当前 DSH ${info.active ?? '未知'}（${info.source === 'bundled' ? '内置运行时' : '已安装更新'}）\n` +
+      `内置 DSH ${info.bundled ?? '未知'}\n` +
+      `更新通道 ${info.channel}${info.previous === null ? '' : ` · 上一版本 ${info.previous}`}\n` +
+      `已安装版本 ${info.installed.length === 0 ? '（无）' : info.installed.join(', ')}\n` +
+      `上次检查 ${info.lastCheck ?? '从未'}\n\n` +
+      `配置目录 ${dshHome()}\n` +
+      `日志 ${logFile}`,
+    buttons: ['好的'],
+  });
 }
 
 // ─── app lifecycle ───────────────────────────────────────────────────────────

@@ -19,7 +19,35 @@
         user-select: none;
         overflow: hidden;
       }
-      body { display: flex; flex-direction: column; padding: 18px 22px; gap: 14px; }
+      body {
+        display: flex;
+        flex-direction: column;
+        gap: 0;
+        padding: 0;
+      }
+      /* The cards scroll; the footer does not. A fixed window is only usable on
+         a small display if the content can give, and the work area on a 150%
+         display is barely 700 logical pixels tall — less than the cards need. */
+      main {
+        flex: 1;
+        min-height: 0;
+        overflow-y: auto;
+        /* Reserve the scrollbar's width whether or not it is showing, so the
+           cards never reflow when the content grows past the window. */
+        scrollbar-gutter: stable;
+        padding: 18px 22px 0;
+        display: flex;
+        flex-direction: column;
+        gap: 14px;
+      }
+      main::-webkit-scrollbar { width: 10px; }
+      main::-webkit-scrollbar-thumb {
+        background: #3a3f49;
+        border-radius: 5px;
+        border: 2px solid #1b1c1f;
+      }
+      main::-webkit-scrollbar-thumb:hover { background: #4a505c; }
+      main::-webkit-scrollbar-track { background: transparent; }
 
       h1 { margin: 0; font-size: 15px; font-weight: 600; letter-spacing: 0.2px; }
       .sub { margin: 2px 0 0; font-size: 12px; color: #868d9b; }
@@ -120,25 +148,112 @@
 
       .warn { margin: 6px 0 0; font-size: 11px; color: #f0b357; }
 
-      .spacer { flex: 1; }
-      .footer { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+      .row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        margin-bottom: 9px;
+      }
+      .row:last-child { margin-bottom: 0; }
+      .row .rowLabel { font-size: 12.5px; color: #cfd4de; }
+      .row .rowNote { font-size: 11px; color: #757c8a; margin-top: 2px; }
+
+      /* A slider that shares a line with its label and value. */
+      .inline { display: flex; align-items: center; gap: 10px; }
+      .inline input[type="range"] { width: 132px; }
+      .inline .value { min-width: 34px; }
+
+      input[type="checkbox"] {
+        appearance: none;
+        -webkit-appearance: none;
+        width: 32px;
+        height: 18px;
+        border-radius: 9px;
+        background: #343943;
+        border: 1px solid #414652;
+        position: relative;
+        cursor: pointer;
+        flex: none;
+        transition: background 0.12s ease;
+      }
+      input[type="checkbox"]::after {
+        content: "";
+        position: absolute;
+        top: 2px;
+        left: 2px;
+        width: 12px;
+        height: 12px;
+        border-radius: 50%;
+        background: #9aa2b1;
+        transition: transform 0.12s ease, background 0.12s ease;
+      }
+      input[type="checkbox"]:checked { background: #3550d8; border-color: #4d6bfe; }
+      input[type="checkbox"]:checked::after { transform: translateX(14px); background: #fff; }
+      input[type="checkbox"]:disabled { opacity: 0.4; cursor: default; }
+
+      .footer {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 10px;
+        flex: none;
+        padding: 12px 22px 18px;
+        border-top: 1px solid #26292f;
+        background: #1b1c1f;
+      }
       .notice { font-size: 11px; color: #757c8a; }
     </style>
   </head>
   <body>
-    <header>
-      <h1>背景设置</h1>
-      <p class="sub">背景图铺满窗口，界面面板半透明后从上面透出来</p>
-    </header>
+    <main>
+      <header>
+        <h1>背景设置</h1>
+        <p class="sub">背景图或视频铺满窗口，界面面板半透明后从上面透出来</p>
+      </header>
 
     <div class="card">
       <div class="fileRow">
         <div class="fileInfo">
-          <div class="fileLabel">背景图片</div>
+          <div class="fileLabel">背景文件</div>
           <div class="fileName empty" id="fileName">未设置</div>
         </div>
-        <button class="primary" id="choose">选择图片…</button>
+        <button class="primary" id="choose">选择图片或视频…</button>
       </div>
+      <p class="hint" id="fileHint">图片与动图（GIF、动态 WebP/AVIF、APNG）和视频（MP4、WebM…）都可以，动图与视频会自动循环播放。</p>
+    </div>
+
+    <div class="card" id="videoCard" hidden>
+      <div class="fieldHead" style="margin-bottom: 9px">
+        <span>视频播放</span>
+        <span class="tag" id="videoMeta">读取中…</span>
+      </div>
+
+      <div class="row">
+        <div class="rowLabel">播放速度</div>
+        <div class="inline">
+          <input type="range" id="videoSpeed" min="25" max="100" step="5" value="100" />
+          <span class="value" id="videoSpeedValue">1.00×</span>
+        </div>
+      </div>
+
+      <div class="row">
+        <div>
+          <div class="rowLabel">静音</div>
+          <div class="rowNote">浏览器不允许带声音自动播放，关掉会让背景停在原地。</div>
+        </div>
+        <input type="checkbox" id="videoMuted" />
+      </div>
+
+      <div class="row">
+        <div>
+          <div class="rowLabel">窗口不可见时暂停</div>
+          <div class="rowNote">最小化或切到别的应用就停下，省电。</div>
+        </div>
+        <input type="checkbox" id="videoPauseHidden" />
+      </div>
+
+      <p class="warn" id="videoWarn" hidden></p>
     </div>
 
     <div class="card">
@@ -181,11 +296,10 @@
         <option value="dark">深色</option>
         <option value="theme">跟随 DSH 主题</option>
       </select>
-      <p class="hint">背景图偏暗就自动换成深色界面，文字才和背景搭。装了背景图期间，这里的选择会覆盖 DSH 自带主题的配色。</p>
+      <p class="hint">背景偏暗就自动换成深色界面，文字才和背景搭。装了背景期间，这里的选择会覆盖 DSH 自带主题的配色。视频无法自动测光，默认按深色处理。</p>
       <p class="warn" id="paletteWarn" hidden></p>
     </div>
-
-    <div class="spacer"></div>
+    </main>
 
     <div class="footer">
       <button id="clear">清除背景</button>
