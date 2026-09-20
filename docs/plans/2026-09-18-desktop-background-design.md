@@ -191,9 +191,27 @@ body[data-ds-dark-theme] {
 - **画布单独一个滑块。** `--dsw-alias-bg-base`（整个应用画布）此前与面板同一个不透明度，于是面板要可读、画布就得一起发灰。现在画布有独立滑块，可以调到 0，背景图完整露出来，面板仍留在 60% 左右保证文字对比度。
 - **窗口底色取自壁纸。** 主窗口 `backgroundColor` 由 `#1b1c1f` 改为壁纸的平均色（`win.setBackgroundColor`），首帧之前不再先闪一下深灰。
 
+### 5. 换第二张图不生效（v2 实测后补修）
+
+实机反馈：「第一次选背景图片生效，再选其他图片就不生效，生效的还是第一个。」
+
+原因不在选图链路，而在图片 URL。`dshbg://bg/current` 这个 URL 从头到尾没变过，协议响应是按 URL 缓存的，于是浏览器一直用第一次取到的那张位图回答后续所有请求。`chooseImage()` 其实做对了每一件事——文件拷过去了、设置写了、样式也重注入了（日志里一串 `image set to …`）——只有屏幕上的图没换。更糟的是配色会跟着换：亮图的摘要一算，界面翻成浅色，底下却还是那张深色壁纸，于是又回到「文字跟背景不搭」。
+
+修法：URL 上带一段图片内容的短摘要（`?v=<sha1 前 12 位>`），换图即换 URL，缓存自然失效；内容不变则摘要不变，缓存照旧复用。摘要取自字节而不是 `mtime + size`，是因为换图是把新文件拷到同名路径上，而 Windows 的 `CopyFileW` 会保留源文件的时间戳，光凭这两项认不出两张图；分析缓存也在选图后显式清空，理由相同。
+
+复现与验证用一个临时脚本驱动（把新图拷到配置的文件上，再调 `manager.refresh()`，正是 `chooseImage()` 对文件做的那一步）：
+
+| | 修复前 | 修复后 |
+| --- | --- | --- |
+| 第一次（地球，深色） | `url: dshbg://bg/current`，`label #f9fafb` | `?v=c65acdef25de`，`label #f9fafb` |
+| 换成亮色渐变图 | `url: dshbg://bg/current`（**没变**），截图上仍是地球，界面却已翻成浅色 | `?v=a351282bf7a5`，截图是亮色渐变图，界面浅色 |
+| 再换回地球 | — | `?v=c65acdef25de`，截图回到地球，界面深色 |
+
+顺带一句：这个 bug 与主题设置无关，用户当前磁盘上的 `current.jpg` 本身没问题，更新后重启即可正常显示，不必重新选图。
+
 ### 验证方式
 
-新增 `scripts/preview-background.cjs`：用仓库自带的 Electron 加载真实 DSH 页面（默认自起一个隔离的 `dsh web`，也可以 `PREVIEW_URL` 指向正在运行的实例），套用生产环境的 `electron/background.js`，`capturePage()` 落成 PNG，并打印 `pageDark` / `label` / 各表面令牌的计算值 / `_fade`、`_composerSeat` 的 `background-image` 作为断言。本轮据此逐项确认：
+新增 `scripts/preview-background.cjs`：用仓库自带的 Electron 加载真实 DSH 页面（默认自起一个隔离的 `dsh web`，也可以 `PREVIEW_URL` 指向正在运行的实例），套用生产环境的 `electron/background.js`，`capturePage()` 落成 PNG，并打印 `pageDark` / `label` / `imageUrl` / 各表面令牌的计算值 / `_fade`、`_composerSeat` 的 `background-image` 作为断言。本轮据此逐项确认：
 
 | 检查项 | 结果 |
 | --- | --- |

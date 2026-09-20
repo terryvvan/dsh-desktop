@@ -38,6 +38,7 @@
 
 const { BrowserWindow, dialog, ipcMain, nativeImage, nativeTheme, protocol } = require('electron');
 const { Readable } = require('node:stream');
+const { createHash } = require('node:crypto');
 const path = require('node:path');
 const fs = require('node:fs');
 
@@ -45,7 +46,13 @@ const fs = require('node:fs');
 const SCHEME = 'dshbg';
 /** Only this host is served; every other authority is refused. */
 const HOST = 'bg';
-/** Stable URL used by the injected stylesheet. */
+/**
+ * Base URL of the current image. The stylesheet appends the image's own content
+ * digest as a query, which is what makes picking a second wallpaper work: the
+ * protocol response is cached by URL, so a stable URL would keep serving the
+ * first image for the rest of the session (and beyond — the disk cache
+ * outlives the app). The handler ignores the path and the query alike.
+ */
 const IMAGE_URL = `${SCHEME}://${HOST}/current`;
 
 /**
@@ -253,12 +260,20 @@ function createBackgroundManager({ userDataDir, log, getMainWindow, onChange }) 
   }
 
   /**
-   * Mean colour and luminance of an image, measured on a 32px-wide decode
-   * rather than the full file. Cached per file revision: the sliders re-render
-   * the stylesheet continuously and must not re-decode a 5 MB wallpaper.
+   * Everything the shell needs to know about the stored image: the mean colour
+   * and luminance, measured on a 32px-wide decode rather than the full file,
+   * and a digest of its bytes.
+   *
+   * Cached per file revision, because the sliders re-render the stylesheet
+   * continuously and must not re-read a 5 MB wallpaper on every tick.
+   *
+   * The digest is what the injected `url()` carries. Identity has to come from
+   * the bytes: re-picking a wallpaper copies it over the same file name, and
+   * Windows' copy preserves the source file's timestamps, so mtime and size
+   * are not enough to tell two images apart.
    *
    * @param {string} absolute
-   * @returns {{ color: string, luminance: number } | null}
+   * @returns {{ digest: string, color: string, luminance: number } | null}
    */
   function analyzeImage(absolute) {
     let revision;
@@ -273,6 +288,11 @@ function createBackgroundManager({ userDataDir, log, getMainWindow, onChange }) 
 
     let result = null;
     try {
+      const digest = createHash('sha1').update(fs.readFileSync(absolute)).digest('hex').slice(0, 12);
+      // A digest is still worth having when the file cannot be decoded for
+      // measurement (the browser may yet render it), so start from a neutral
+      // answer and improve it only if the decode works.
+      result = { digest, color: DEFAULT_WINDOW_COLOR, luminance: DARK_LUMINANCE };
       const image = nativeImage.createFromPath(absolute);
       if (!image.isEmpty()) {
         const small = image.resize({ width: 32, quality: 'good' });
@@ -297,6 +317,7 @@ function createBackgroundManager({ userDataDir, log, getMainWindow, onChange }) 
         }
         const mean = (value) => Math.round(clamp(value / pixels, 0, 255));
         result = {
+          digest,
           color: `#${[mean(r), mean(g), mean(b)].map((v) => v.toString(16).padStart(2, '0')).join('')}`,
           luminance: clamp(luminance / pixels / 255, 0, 1),
         };
@@ -394,6 +415,23 @@ function createBackgroundManager({ userDataDir, log, getMainWindow, onChange }) 
     return analysis === null ? DEFAULT_WINDOW_COLOR : analysis.color;
   }
 
+  /**
+   * URL of the stored image, tagged with the digest of its bytes.
+   *
+   * Without the tag the browser would answer every request for the same URL
+   * with the bitmap it already has, so choosing a second wallpaper would change
+   * the settings file, the palette and the window colour — everything except
+   * the picture on screen. The tag is content-derived, so an unchanged image
+   * keeps its cache entry and a changed one cannot collide with it.
+   *
+   * @returns {string}
+   */
+  function imageUrl() {
+    const absolute = settings.enabled ? currentImagePath() : null;
+    const analysis = absolute === null ? null : analyzeImage(absolute);
+    return analysis === null ? IMAGE_URL : `${IMAGE_URL}?v=${analysis.digest}`;
+  }
+
   // ─── stylesheet ────────────────────────────────────────────────────────────
 
   /**
@@ -487,7 +525,7 @@ ${surfacesFor('dark')}
 
     return `/* desktop background — injected by electron/background.js */
 body {
-  background-image: linear-gradient(${scrim}, ${scrim}), url("${IMAGE_URL}") !important;
+  background-image: linear-gradient(${scrim}, ${scrim}), url("${imageUrl()}") !important;
   background-size: cover, cover !important;
   background-position: center center, center center !important;
   background-repeat: no-repeat, no-repeat !important;
@@ -644,6 +682,10 @@ ${surfaceLayer}
       // moves or deletes would silently blank the background.
       fs.copyFileSync(source, path.join(imagesDir, name));
       pruneOldCopies(name);
+      // The revision key is mtime + size, and a copy keeps the source's
+      // timestamps: drop the old analysis so the new bytes are always measured,
+      // never inherited from the image this one replaced.
+      analysisCache.clear();
     } catch (error) {
       log(`background: failed to import image: ${error.message}`);
       dialog.showErrorBox('背景设置 — 无法读取图片', `${source}\n\n${error.message}`);

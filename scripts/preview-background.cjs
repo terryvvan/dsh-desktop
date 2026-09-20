@@ -206,6 +206,8 @@ async function main() {
       return {
         pageDark: document.body.hasAttribute('data-ds-dark-theme'),
         computedScheme: getComputedStyle(document.documentElement).colorScheme,
+        // Carries the image's content digest, so it must change with the picture.
+        imageUrl: /url\\("([^"]+)"\\)/.exec(body.backgroundImage)?.[1] ?? null,
         label: token('--dsw-alias-label-primary'),
         canvas: token('--dsw-alias-bg-base'),
         sidebar: token('--dsw-specific-sidebar-fill'),

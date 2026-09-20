@@ -159,6 +159,7 @@ npm run dist                   # 产出安装包 + 绿色版
 ### 实现要点
 
 - 图片通过自定义协议 `dshbg://` 流式返回，不做 base64、不重新编码，画质无损。协议处理器忽略请求路径、永远只返回当前配置的那一个文件，不会变成任意文件读取通道。
+- 图片 URL 带一段图片内容的短摘要（`dshbg://bg/current?v=…`）。协议响应按 URL 缓存，URL 不变时换图只会改设置、改配色，屏幕上还是第一张；摘要取自字节，因为换图是把新文件拷到同名路径上，而 Windows 的复制会保留源文件的时间戳，光凭 mtime 和大小认不出两张图。
 - 选中的图片会**复制**到 `%APPDATA%\DeepSeek Harness\backgrounds\`，原图之后被移动或删除都不影响。
 - 设置存在 `%APPDATA%\DeepSeek Harness\background.json`（`uiOpacity` / `canvasOpacity` / `dim` / `palette`）。滑块拖动时立即重绘样式，只有写盘做了 300ms 防抖。
 - 主窗口的底色取自壁纸的平均色（`win.setBackgroundColor`），页面首帧之前不会先闪一下深灰。
