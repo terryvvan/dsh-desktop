@@ -77,7 +77,12 @@ const backgroundManager = createBackgroundManager({
   userDataDir: app.getPath('userData'),
   log,
   getMainWindow: () => mainWindow,
-  onChange: () => buildMenu(),
+  // The palette and the window's own base colour are part of the background,
+  // so both follow every persisted change.
+  onChange: () => {
+    backgroundManager.applyEnvironment();
+    buildMenu();
+  },
 });
 
 // Privileged schemes have to be declared before the app is ready, which is why
@@ -377,7 +382,9 @@ function showMainWindow(url) {
     minHeight: 600,
     show: false,
     title: APP_TITLE,
-    backgroundColor: '#1b1c1f',
+    // The wallpaper's own mean colour while configured, so the first paint
+    // blends into the image instead of flashing the shell's dark chrome.
+    backgroundColor: backgroundManager.windowBackground(),
     autoHideMenuBar: false,
     webPreferences: {
       contextIsolation: true,
@@ -745,6 +752,9 @@ if (!app.requestSingleInstanceLock()) {
     log(`--- ${APP_TITLE} shell ${app.getVersion()} starting ---`);
     runtimeManager.cleanStaging();
     backgroundManager.install();
+    // A configured wallpaper decides the palette, and therefore what the
+    // runtime's pages resolve `prefers-color-scheme` to, before they boot.
+    backgroundManager.applyEnvironment();
     buildMenu();
     if (!preflight()) {
       app.quit();

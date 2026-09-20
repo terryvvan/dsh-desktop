@@ -19,7 +19,7 @@
         user-select: none;
         overflow: hidden;
       }
-      body { display: flex; flex-direction: column; padding: 20px 22px; gap: 18px; }
+      body { display: flex; flex-direction: column; padding: 18px 22px; gap: 14px; }
 
       h1 { margin: 0; font-size: 15px; font-weight: 600; letter-spacing: 0.2px; }
       .sub { margin: 2px 0 0; font-size: 12px; color: #868d9b; }
@@ -28,7 +28,7 @@
         border: 1px solid #2c2f36;
         border-radius: 10px;
         background: #202226;
-        padding: 14px 15px;
+        padding: 13px 15px;
       }
 
       .fileRow { display: flex; align-items: center; gap: 12px; }
@@ -60,15 +60,17 @@
       button:disabled { opacity: 0.45; cursor: default; }
       button:disabled:hover { background: #2b2f37; border-color: #3a3f49; }
 
-      .field { margin-bottom: 16px; }
+      .field { margin-bottom: 13px; }
       .field:last-child { margin-bottom: 0; }
       .fieldHead {
         display: flex;
         justify-content: space-between;
         align-items: baseline;
-        margin-bottom: 7px;
+        margin-bottom: 6px;
+        gap: 10px;
       }
       .fieldHead span:first-child { font-size: 12.5px; color: #cfd4de; }
+      .fieldHead .tag { font-size: 10.5px; color: #6f7684; }
       .value {
         font-size: 12px;
         color: #8ea2ff;
@@ -76,7 +78,7 @@
         min-width: 40px;
         text-align: right;
       }
-      .hint { margin: 6px 0 0; font-size: 11px; color: #757c8a; }
+      .hint { margin: 4px 0 0; font-size: 11px; color: #757c8a; }
 
       input[type="range"] {
         -webkit-appearance: none;
@@ -103,6 +105,21 @@
       input[type="range"]:disabled { opacity: 0.4; cursor: default; }
       input[type="range"]:disabled::-webkit-slider-thumb { cursor: default; }
 
+      select {
+        font: inherit;
+        font-size: 12.5px;
+        width: 100%;
+        color: #dfe3ea;
+        background: #2b2f37;
+        border: 1px solid #3a3f49;
+        border-radius: 7px;
+        padding: 6px 8px;
+        cursor: pointer;
+      }
+      select:focus { outline: 1px solid #4d6bfe; }
+
+      .warn { margin: 6px 0 0; font-size: 11px; color: #f0b357; }
+
       .spacer { flex: 1; }
       .footer { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
       .notice { font-size: 11px; color: #757c8a; }
@@ -127,11 +144,20 @@
     <div class="card">
       <div class="field">
         <div class="fieldHead">
-          <span>界面不透明度</span>
-          <span class="value" id="uiValue">78%</span>
+          <span>面板不透明度</span>
+          <span class="value" id="uiValue">72%</span>
         </div>
-        <input type="range" id="uiOpacity" min="20" max="100" step="1" value="78" />
-        <p class="hint">调低则侧边栏、对话区、卡片更透明，背景图更明显。文字始终保持不透明。</p>
+        <input type="range" id="uiOpacity" min="20" max="100" step="1" value="72" />
+        <p class="hint">侧边栏、卡片和输入框。调低则背景图更明显，文字始终保持不透明。</p>
+      </div>
+
+      <div class="field">
+        <div class="fieldHead">
+          <span>画布不透明度</span>
+          <span class="value" id="canvasValue">32%</span>
+        </div>
+        <input type="range" id="canvasOpacity" min="0" max="100" step="1" value="32" />
+        <p class="hint">主对话区的底色。调低（或调到 0）可以让背景图几乎完整地露出来。</p>
       </div>
 
       <div class="field">
@@ -142,6 +168,21 @@
         <input type="range" id="dim" min="0" max="85" step="1" value="25" />
         <p class="hint">背景图太亮时调高，压一层黑让上面的文字更好认。</p>
       </div>
+    </div>
+
+    <div class="card">
+      <div class="fieldHead" style="margin-bottom: 7px">
+        <span>界面配色</span>
+        <span class="tag" id="paletteState">跟随背景图</span>
+      </div>
+      <select id="palette">
+        <option value="auto">跟随背景图（推荐）</option>
+        <option value="light">浅色</option>
+        <option value="dark">深色</option>
+        <option value="theme">跟随 DSH 主题</option>
+      </select>
+      <p class="hint">背景图偏暗就自动换成深色界面，文字才和背景搭。装了背景图期间，这里的选择会覆盖 DSH 自带主题的配色。</p>
+      <p class="warn" id="paletteWarn" hidden></p>
     </div>
 
     <div class="spacer"></div>

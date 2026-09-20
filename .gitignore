@@ -5,3 +5,6 @@ build/icon.png
 build/icon.svg
 build/icon.ico
 .updater-test/
+.preview-dsh-home/
+.preview-userdata/
+shot.png

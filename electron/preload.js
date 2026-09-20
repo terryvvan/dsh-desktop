@@ -14,11 +14,14 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('dshBackground', {
-  /** Current settings, without any absolute path. */
+  /** Current settings, without any absolute path, plus what the page renders. */
   get: () => ipcRenderer.invoke('dshbg:get'),
   /** Open a file picker, copy the choice into the app's own image store. */
   choose: () => ipcRenderer.invoke('dshbg:choose'),
-  /** Apply a partial patch: `{ uiOpacity }`, `{ dim }` or `{ enabled }`. */
+  /**
+   * Apply a partial patch: `{ uiOpacity }`, `{ canvasOpacity }`, `{ dim }`,
+   * `{ palette }` or `{ enabled }`.
+   */
   update: (patch) => ipcRenderer.invoke('dshbg:update', patch),
   /** Turn the background off and delete the copied image. */
   clear: () => ipcRenderer.invoke('dshbg:clear'),
