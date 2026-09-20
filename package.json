@@ -12,6 +12,7 @@
     "make:icon": "node scripts/make-icon.mjs",
     "test:updater": "node scripts/test-updater.mjs",
     "test:updater:check": "node scripts/test-updater.mjs --check-only",
+    "test:profile-guard": "node scripts/test-profile-guard.mjs",
     "start": "electron .",
     "dist": "electron-builder --win",
     "dist:nsis": "electron-builder --win nsis",

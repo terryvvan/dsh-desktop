@@ -21,10 +21,17 @@ const path = require('node:path');
 const fs = require('node:fs');
 const { createRuntimeManager } = require('./updater');
 const { createBackgroundManager } = require('./background');
+const { createProfileGuard } = require('./profile-guard');
 
 const APP_ID = 'ai.deepseek.harness.desktop';
 const APP_TITLE = 'DeepSeek Harness';
 const BOOT_TIMEOUT_MS = 180000;
+/** Grace period for a taskkilled kernel to actually be reaped before moving on. */
+const STOP_TIMEOUT_MS = 10000;
+/** `dsh web` is an alias for `--profile web`; that profile is what we guard. */
+const WEB_PROFILE = 'web';
+/** Kernel output lines kept for boot-failure attribution (boot phase only). */
+const KERNEL_OUTPUT_LINES = 400;
 /** `dsh web: http://127.0.0.1:PORT/?<token> (LAN: ...)` — printed by dsh-web-app. */
 const URL_LINE = /dsh web:\s+(https?:\/\/\S+)/;
 
@@ -52,6 +59,16 @@ let quitting = false;
 let restarting = false;
 let installing = false;
 let startupCheckStarted = false;
+/**
+ * Config recovery stages already tried for the current failure streak: 0 = none,
+ * 1 = last-known-good config restored, 2 = safe mode. Reset by a successful boot
+ * so a user who fixes their config by hand is never blocked by a spent budget.
+ */
+let configRecoveryStage = 0;
+/** True once third-party bundles were disabled to get the app running again. */
+let safeModeActive = false;
+/** Boot-phase kernel output, used to name the plugin that broke the boot. */
+const kernelOutput = [];
 const exitWaiters = [];
 
 // ─── logging ─────────────────────────────────────────────────────────────────
@@ -83,6 +100,18 @@ const backgroundManager = createBackgroundManager({
     backgroundManager.applyEnvironment();
     buildMenu();
   },
+});
+
+/**
+ * Remembers the profile config that last booted, so a plugin that breaks
+ * startup can be rolled back automatically instead of leaving the user with an
+ * app that will not open.
+ */
+const profileGuard = createProfileGuard({
+  dshHome: dshHome(),
+  userDataDir: app.getPath('userData'),
+  profileName: WEB_PROFILE,
+  log,
 });
 
 // Privileged schemes have to be declared before the app is ready, which is why
@@ -167,7 +196,11 @@ function startRuntime() {
   log(`spawning runtime: ${runtimeManager.paths.nodeExe} ${active.dshBin} web --port 0 --no-open`);
   log(`DSH_HOME=${dshHome()}`);
 
-  runtime = spawn(
+  // Keep our own handle on the child. Every event handler below re-checks it
+  // against `runtime`, because a kernel we killed can still emit 'exit' after
+  // its replacement has been spawned; such an event must never be attributed to
+  // the new kernel or it would be reported as a boot failure.
+  const child = spawn(
     runtimeManager.paths.nodeExe,
     [active.dshBin, 'web', '--port', '0', '--no-open'],
     {
@@ -177,24 +210,32 @@ function startRuntime() {
       stdio: ['ignore', 'pipe', 'pipe'],
     },
   );
+  runtime = child;
+  kernelOutput.length = 0;
 
   let pending = '';
-  runtime.stdout.setEncoding('utf8');
-  runtime.stdout.on('data', (chunk) => {
+  child.stdout.setEncoding('utf8');
+  child.stdout.on('data', (chunk) => {
     process.stdout.write(chunk);
     pending += chunk;
     let index;
     while ((index = pending.indexOf('\n')) !== -1) {
       const line = pending.slice(0, index);
       pending = pending.slice(index + 1);
-      onRuntimeLine(line);
+      onRuntimeLine(line, child);
     }
     if (pending.length > 8192) pending = pending.slice(-8192);
   });
 
-  runtime.stderr.setEncoding('utf8');
-  runtime.stderr.on('data', (chunk) => {
+  child.stderr.setEncoding('utf8');
+  child.stderr.on('data', (chunk) => {
     process.stderr.write(chunk);
+    // Every line the kernel prints before its address is diagnostic gold: it is
+    // the only place a failed plugin names itself. (stderr is already mirrored
+    // into the log verbatim just below.)
+    for (const line of chunk.split(/\r?\n/)) {
+      if (line.trim() !== '') recordKernelOutput(line, false);
+    }
     try {
       fs.mkdirSync(logDir, { recursive: true });
       fs.appendFileSync(logFile, chunk, 'utf8');
@@ -203,15 +244,20 @@ function startRuntime() {
     }
   });
 
-  runtime.on('error', (error) => {
+  child.on('error', (error) => {
     // A failure to spawn is an environment problem, not a bad runtime version,
     // so it must not trigger a rollback.
     log(`runtime spawn error: ${error.message}`);
+    if (runtime !== child) return;
     clearBootTimer();
     failBoot(`无法启动内核进程：${error.message}`);
   });
 
-  runtime.on('exit', (code, signal) => {
+  child.on('exit', (code, signal) => {
+    if (runtime !== child) {
+      log(`stale runtime exited code=${code} signal=${signal} (ignored)`);
+      return;
+    }
     log(`runtime exited code=${code} signal=${signal}`);
     runtime = null;
     for (const waiter of exitWaiters.splice(0)) waiter();
@@ -251,59 +297,180 @@ function clearBootTimer() {
   bootTimer = null;
 }
 
-function onRuntimeLine(line) {
+/**
+ * Remember one boot-phase kernel line for failure attribution. Kernel stdout is
+ * also mirrored into the log with a `kernel| ` marker, because desktop.log
+ * otherwise only carries stderr and a failed boot's own words are exactly what
+ * is needed to name the culprit later.
+ */
+function recordKernelOutput(line, mirror = true) {
+  if (appUrl !== null) return;
+  kernelOutput.push(line);
+  if (kernelOutput.length > KERNEL_OUTPUT_LINES) kernelOutput.splice(0, kernelOutput.length - KERNEL_OUTPUT_LINES);
+  if (!mirror) return;
+  try {
+    fs.mkdirSync(logDir, { recursive: true });
+    fs.appendFileSync(logFile, `kernel| ${line}\n`, 'utf8');
+  } catch {
+    /* best effort */
+  }
+}
+
+function onRuntimeLine(line, child) {
+  // Ignore anything a superseded kernel still manages to print on its way out.
+  if (runtime !== child) return;
   const trimmed = line.trim();
   if (trimmed !== '') console.log(trimmed);
   const match = URL_LINE.exec(trimmed);
-  if (match === null || appUrl !== null) return;
+  if (match === null) {
+    if (trimmed !== '') recordKernelOutput(trimmed);
+    return;
+  }
+  if (appUrl !== null) return;
   appUrl = match[1];
   clearBootTimer();
   runtimeManager.noteBootSuccess();
   log(`runtime ready at ${appUrl}`);
+  // This config just produced a working kernel, so it becomes the baseline the
+  // next failed boot rolls back to. A recovery budget is spent for good once a
+  // boot succeeds.
+  configRecoveryStage = 0;
+  snapshotGoodConfig();
   // The menu was built before the runtime had an address, so refresh the
   // entries that depend on it.
   buildMenu();
   showMainWindow(appUrl);
 }
 
+/** Snapshot the config behind a successful boot; never fatal to startup. */
+function snapshotGoodConfig() {
+  try {
+    const outcome = profileGuard.snapshot({ keepExisting: safeModeActive });
+    if (outcome.saved) log(`profile-guard: last-good config saved (${outcome.files.join(', ')})`);
+  } catch (error) {
+    log(`profile-guard: snapshot failed: ${error.message}`);
+  }
+}
+
 /**
- * A runtime that cannot start may simply be a bad release. Two consecutive
- * failures on an installed version drop back to the previous one (or to the
- * bundled copy) before the user is told anything went wrong, which is what
- * makes updating safe.
+ * A kernel that cannot start has two very different suspects, and they need
+ * opposite fixes, so they are tried in order of likelihood:
+ *
+ *   1. the profile config changed since the last boot that worked — put the
+ *      known-good config back (this is the common case: a plugin was just
+ *      added, enabled, or hand-edited);
+ *   2. the runtime release itself is bad — the existing two-strikes version
+ *      rollback, which now happens *before* touching plugins, so a broken
+ *      release can never cost the user their plugin setup;
+ *   3. nothing is left to fall back to (the immutable bundled runtime is already
+ *      running) — drop third-party bundles so the app opens at all.
+ *
+ * Only then is the failure terminal.
  */
 function handleBootFailure(detail) {
   clearBootTimer();
-  const outcome = runtimeManager.recordBootFailure(detail);
-  if (!outcome.rolledBack) {
-    failBoot(detail);
+  if (configRecoveryStage < 1 && profileGuard.hasSnapshot() && recoverProfileConfig(detail, 'restore')) {
     return;
   }
-  const target = outcome.source === 'bundled' ? '内置运行时' : `上一个版本 ${outcome.to}`;
-  log(`boot failure on ${outcome.from}; rolled back to ${target}`);
-  dialog.showMessageBoxSync({
-    type: 'warning',
-    title: `${APP_TITLE} — 已回退运行时`,
-    message: `DSH ${outcome.from} 启动失败，已回退到 ${target}`,
-    detail: `${detail}\n\n将用回退后的运行时重启内核。运行日志：${logFile}`,
-    buttons: ['继续'],
-  });
-  void restartRuntime();
+
+  // A runtime that cannot start may simply be a bad release. Two consecutive
+  // failures on an installed version drop back to the previous one (or to the
+  // bundled copy) before the user is told anything went wrong, which is what
+  // makes updating safe.
+  const outcome = runtimeManager.recordBootFailure(detail);
+  if (outcome.rolledBack) {
+    const target = outcome.source === 'bundled' ? '内置运行时' : `上一个版本 ${outcome.to}`;
+    log(`boot failure on ${outcome.from}; rolled back to ${target}`);
+    dialog.showMessageBoxSync({
+      type: 'warning',
+      title: `${APP_TITLE} — 已回退运行时`,
+      message: `DSH ${outcome.from} 启动失败，已回退到 ${target}`,
+      detail: `${detail}\n\n将用回退后的运行时重启内核。运行日志：${logFile}`,
+      buttons: ['继续'],
+    });
+    void restartRuntime();
+    return;
+  }
+
+  // Nothing left to roll back to: strip the third-party plugins rather than
+  // leave the user with an app that will not open at all.
+  if (
+    !safeModeActive &&
+    runtimeManager.describe().source === 'bundled' &&
+    recoverProfileConfig(detail, 'safe-mode')
+  ) {
+    return;
+  }
+
+  failBoot(detail);
 }
 
-/** Kill the runtime and its whole process tree (dsh spawns shells/subagents). */
+/**
+ * Run one config-recovery stage. Returns true when the kernel is being
+ * restarted on repaired config, i.e. when the caller must not treat this as a
+ * terminal failure.
+ *
+ * @param mode - 'restore' puts the last known-good config back (a no-op when the
+ *   config never changed), 'safe-mode' disables third-party bundles.
+ */
+function recoverProfileConfig(detail, mode) {
+  const output = kernelOutput.join('\n');
+  let outcome = null;
+  try {
+    outcome =
+      mode === 'restore'
+        ? profileGuard.restoreLastGood({ output, detail })
+        : profileGuard.enterSafeMode({ output, detail });
+  } catch (error) {
+    log(`profile-guard: ${mode} recovery failed: ${error.message}`);
+    return false;
+  }
+  if (!outcome.recovered) {
+    log(`profile-guard: ${mode} recovery skipped (${outcome.reason})`);
+    return false;
+  }
+
+  configRecoveryStage = Math.max(configRecoveryStage, mode === 'restore' ? 1 : 2);
+  if (mode === 'safe-mode') safeModeActive = true;
+  log(
+    `profile-guard: ${outcome.mode} recovery restored ${outcome.restored.join(', ') || '(nothing)'}` +
+      `${outcome.removed.length > 0 ? `, removed ${outcome.removed.join(', ')}` : ''}; ` +
+      `suspected ${outcome.culprits.join(', ') || '(unknown)'}; backup ${outcome.backupDir}`,
+  );
+  notifyConfigRecovery(outcome, detail);
+  void restartRuntime();
+  return true;
+}
+
+/**
+ * Kill the runtime and its whole process tree (dsh spawns shells/subagents).
+ *
+ * Resolves only once node has delivered the child's 'exit' event, i.e. once the
+ * process is really gone. `taskkill` exiting tells us nothing: termination is
+ * asynchronous, and its exit event can arrive after the caller has already
+ * spawned the replacement kernel — which used to null out `runtime`, drop the
+ * live kernel's handle, and raise a bogus "内核在报告监听地址之前就退出了" dialog.
+ */
 function stopRuntime() {
   clearBootTimer();
+  const child = runtime;
+  if (child === null || child.pid === undefined || child.exitCode !== null) {
+    return Promise.resolve();
+  }
   return new Promise((resolve) => {
-    const child = runtime;
-    if (child === null || child.pid === undefined || child.exitCode !== null) {
+    const done = (late) => {
+      if (late) log(`stop: kernel ${child.pid} was still alive after ${STOP_TIMEOUT_MS} ms, continuing anyway`);
+      clearTimeout(timer);
+      const index = exitWaiters.indexOf(waiter);
+      if (index !== -1) exitWaiters.splice(index, 1);
       resolve();
-      return;
-    }
-    exitWaiters.push(resolve);
+    };
+    const waiter = () => done(false);
+    const timer = setTimeout(() => done(true), STOP_TIMEOUT_MS);
+    exitWaiters.push(waiter);
     execFile('taskkill', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true }, (error) => {
+      // Only used to kill; completion is signalled by the child's 'exit' event.
       if (error) log(`taskkill failed: ${error.message}`);
-      resolve();
     });
   });
 }
@@ -321,6 +488,132 @@ async function restartRuntime() {
     showSplash();
   }
   startRuntime();
+}
+
+// ─── config recovery reporting ───────────────────────────────────────────────
+
+/** One bullet per restored/removed file, relative to DSH_HOME. */
+function describeConfigChanges(outcome) {
+  const lines = [];
+  for (const rel of outcome.restored) lines.push(`· 已恢复 ${rel}`);
+  for (const rel of outcome.removed) lines.push(`· 已移除 ${rel}（新增的补丁层，已备份）`);
+  for (const rel of outcome.kept ?? []) lines.push(`· 保留 ${rel}（缺失的锁文件不自动重建，如需请重新安装插件）`);
+  return lines.join('\n');
+}
+
+/** "疑似元凶" block shared by the automatic and the manual recovery dialogs. */
+function describeCulprits(outcome) {
+  const lines = [];
+  if (outcome.culprits !== undefined && outcome.culprits.length > 0) {
+    lines.push(`疑似导致启动失败的插件：${outcome.culprits.join('、')}`);
+  } else if (outcome.configFiles !== undefined && outcome.configFiles.length > 0) {
+    lines.push(`失败原因是配置文件无法解析：${outcome.configFiles.join('、')}`);
+  } else {
+    lines.push('未能确定具体插件，已按整体配置回退。');
+  }
+  if (outcome.configFiles !== undefined && outcome.configFiles.length > 0 && outcome.culprits !== undefined && outcome.culprits.length > 0) {
+    lines.push(`同时无法解析：${outcome.configFiles.join('、')}`);
+  }
+  if (outcome.disabled !== undefined && outcome.disabled.length > 0) {
+    lines.push(`已停用第三方插件：${outcome.disabled.join('、')}`);
+  }
+  for (const line of outcome.evidence ?? []) lines.push(`内核报告：${line}`);
+  return lines.join('\n');
+}
+
+/**
+ * Tell the user what just happened while the repaired kernel boots. Async on
+ * purpose: the restart must not wait for someone to click a button.
+ */
+function notifyConfigRecovery(outcome, detail) {
+  const heading =
+    outcome.mode === 'safe-mode'
+      ? 'DSH 启动失败，已进入安全模式'
+      : `DSH 启动失败，已回退到 ${new Date(outcome.savedAt).toLocaleString()} 的配置`;
+  const lines = [
+    `失败原因：${detail}`,
+    '',
+    describeCulprits(outcome),
+    '',
+    describeConfigChanges(outcome) || '· 配置未发生变化',
+    '',
+    `出错时的配置已备份到：${outcome.backupDir}`,
+    '正在用回退后的配置重启内核。',
+  ];
+  log(`config recovery (${outcome.mode}): ${heading}`);
+  dialog
+    .showMessageBox(mainWindow ?? undefined, {
+      type: 'warning',
+      title: `${APP_TITLE} — 已自动回退配置`,
+      message: heading,
+      detail: lines.filter((line) => line !== undefined).join('\n'),
+      buttons: ['好的', '打开备份目录'],
+      defaultId: 0,
+      cancelId: 0,
+    })
+    .then((result) => {
+      if (result.response === 1) void shell.openPath(outcome.backupDir);
+    })
+    .catch(() => {});
+}
+
+/**
+ * Menu-driven counterpart of the automatic recovery: "go back to the config
+ * that last booted", with the same backup guarantee.
+ */
+async function manualProfileRollback() {
+  const changes = profileGuard.diff();
+  if (changes === null) {
+    dialog.showMessageBoxSync(mainWindow ?? undefined, {
+      type: 'info',
+      title: `${APP_TITLE} — 回退配置`,
+      message: '还没有可用的配置快照',
+      detail: '配置快照会在内核成功启动后自动生成。',
+      buttons: ['好的'],
+    });
+    return;
+  }
+  if (changes.changed.length === 0) {
+    dialog.showMessageBoxSync(mainWindow ?? undefined, {
+      type: 'info',
+      title: `${APP_TITLE} — 回退配置`,
+      message: '当前配置与上次成功启动时一致',
+      detail: `快照时间：${new Date(changes.good.savedAt).toLocaleString()}`,
+      buttons: ['好的'],
+    });
+    return;
+  }
+  const choice = dialog.showMessageBoxSync(mainWindow ?? undefined, {
+    type: 'warning',
+    title: `${APP_TITLE} — 回退配置`,
+    message: '回退到上次成功启动的配置？',
+    detail:
+      `快照时间：${new Date(changes.good.savedAt).toLocaleString()}\n\n` +
+      `将被恢复：\n${changes.changed.map((entry) => `· ${entry.rel}`).join('\n')}\n\n` +
+      `当前配置会先备份到：\n${profileGuard.backupRoot()}\n\n` +
+      '正在运行的会话会被中断。',
+    buttons: ['回退并重启内核', '取消'],
+    defaultId: 0,
+    cancelId: 1,
+  });
+  if (choice !== 0) return;
+
+  let outcome = null;
+  try {
+    outcome = profileGuard.restoreLastGood({ output: kernelOutput.join('\n'), detail: '用户手动回退配置' });
+  } catch (error) {
+    log(`profile-guard: manual rollback failed: ${error.message}`);
+  }
+  if (outcome === null || !outcome.recovered) {
+    dialog.showErrorBox(`${APP_TITLE} — 回退配置`, '回退失败，未做任何改动。请查看运行日志。');
+    return;
+  }
+  // A manually restored config is as good as the automatic stage 1: if it still
+  // fails, safe mode remains available.
+  configRecoveryStage = Math.max(configRecoveryStage, 1);
+  log(`profile-guard: manual rollback restored ${outcome.restored.join(', ') || '(nothing)'}`);
+  notifyConfigRecovery(outcome, '用户手动回退');
+  void restartRuntime();
 }
 
 // ─── windows ─────────────────────────────────────────────────────────────────
@@ -643,6 +936,14 @@ function buildMenu() {
           },
         },
         { type: 'separator' },
+        { label: profileGuard.describeSnapshot(), enabled: false },
+        {
+          label: '回退到上次可用配置',
+          id: 'rollback-profile',
+          enabled: profileGuard.hasSnapshot(),
+          click: () => void manualProfileRollback(),
+        },
+        { type: 'separator' },
         { label: '检查更新…', id: 'check-updates', click: () => void manualCheck() },
         { label: '更新通道', submenu: channelItems },
         {
@@ -663,6 +964,7 @@ function buildMenu() {
         },
         { type: 'separator' },
         { label: `打开配置目录 (${dshHome()})`, click: () => shell.openPath(dshHome()).catch(() => {}) },
+        { label: '打开配置备份目录', click: () => shell.openPath(profileGuard.backupRoot()).catch(() => {}) },
         { label: '打开日志目录', click: () => shell.openPath(logDir).catch(() => {}) },
         { type: 'separator' },
         { label: '退出', accelerator: 'Alt+F4', role: 'quit' },

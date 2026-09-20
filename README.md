@@ -54,6 +54,7 @@ desktop/
   electron/
     main.js                 主进程：拉起内核、解析地址、窗口与菜单生命周期
     updater.js              版本检测、运行时安装、原子切换、失败回滚
+    profile-guard.js        配置快照、失败归因、回退上次可用配置、安全模式
     background.js           背景图与界面透明度：dshbg:// 协议、样式注入、设置持久化
     background.html/-ui.js  背景设置窗口及其渲染逻辑
     preload.js              仅供背景设置窗口使用的 contextBridge 桥接
@@ -66,6 +67,7 @@ desktop/
     make-icon.mjs           用官方标识渲染 build/icon.png 和 build/icon.ico
     test-updater.mjs        不开 Electron 直接验证整条更新链路
     preview-background.cjs  用真实 DSH 页面渲染背景/透明度效果图，核对观感
+    test-profile-guard.mjs  配置回退：离线用例 + 真内核失败归因
   runtime/                  ← 生成物，随安装包分发（约 315 MB）
     node/node.exe
     node/node_modules/npm/  内置 npm，供应用内更新器调用
@@ -90,6 +92,8 @@ npm run dist                   # 产出安装包 + 绿色版
 打包前建议先跑一次 `npm run test:updater`，它会用真实的运行时和一次性用户目录
 把整条更新链路（探测 → 下载 → 安装 → 启动 → 回滚）走一遍，不需要开 Electron。
 判断 master 当前是否可用，用 `npm run test:updater:check` 只探测通道即可，不下载。
+`npm run test:profile-guard` 会用一次性 DSH_HOME 验证配置快照与回退，并且真的拉起内核，
+用「装了一个会抛异常的插件」和「bundles 里写了个没装的包」两种坏配置去校验失败归因。
 
 `npm run dist` 也可以拆成 `npm run dist:nsis`（只要安装包）或
 `npm run dist:green`（只要绿色版 zip）。
@@ -131,8 +135,9 @@ npm run dist                   # 产出安装包 + 绿色版
 | 单实例 | 第二次双击只会把已有窗口拉到前台，不会起第二个内核 |
 | 关闭窗口 | 连同内核及其派生的 shell / 子代理进程一起杀掉（`taskkill /T`） |
 | 内核中途挂掉 | 弹窗给出退出码和日志路径，可选「重启内核」而不必重开应用 |
+| **插件把内核搞挂** | 自动回退到上次成功启动的配置（或安全模式）并重启，同时告知疑似是哪个插件 |
 | 外部链接 | 一律交给系统默认浏览器，窗口本身只承载 `127.0.0.1` |
-| 菜单 | 检查更新 / 更新通道 / 回退 / 重新加载 / 在浏览器中打开 / 重启内核 / 打开配置目录 / 打开日志目录 / 背景设置 / 清除背景图片 / 缩放 / 全屏 / F12 开发者工具 |
+| 菜单 | 检查更新 / 更新通道 / 回退 / 回退到上次可用配置 / 重新加载 / 在浏览器中打开 / 重启内核 / 打开配置目录 / 打开配置备份目录 / 打开日志目录 / 背景设置 / 清除背景图片 / 缩放 / 全屏 / F12 开发者工具 |
 
 日志写在 `%APPDATA%\DeepSeek Harness\logs\desktop.log`。
 
@@ -230,6 +235,79 @@ npm run test:updater:check    # 只探测通道，不下载
 ```
 
 这个脚本用真实的打包运行时和一次性的用户目录，跑的是应用本身的那套代码，因此可以在打包前就把问题挡住。
+
+---
+
+## 插件把内核搞挂时的配置自动回退
+
+内核启动时只加载 profile 声明的那几个插件 bundle，所以**一个坏插件就足以让整个应用打不开**：
+内核要么在打印监听地址之前就退出，要么干脆卡住、永远不打印。而运行时本身不记得「上次能跑的时候
+配置长什么样」，它只会照着当前配置再失败一次。这份记忆由桌面外壳来存。
+
+### 配置快照
+
+内核报出监听地址的那一刻，外壳把决定插件集合的文件抄一份到
+`%APPDATA%\DeepSeek Harness\profile-guard\last-good\`：
+
+| 文件 | 作用 |
+| --- | --- |
+| `$DSH_HOME/cordis.patch.yml` | 机器级补丁层，对所有 profile 生效且优先级最高 |
+| `profiles/web/package.json` | `dsh.profile.bundles`（加载哪些 bundle）+ 插件依赖 |
+| `profiles/web/cordis.patch.yml` | 该 profile 的用户补丁层 |
+| `profiles/web/pnpm-lock.yaml`、`pnpm-workspace.yaml` | 插件安装状态 |
+
+内容没变就不重写，所以快照时间始终指向「这份配置第一次跑起来」的时刻。
+
+### 启动失败之后
+
+失败处理按「最可能的原因优先」排序，而且**绝不会因为运行时版本坏掉而牺牲你的插件配置**：
+
+1. **配置回退**：配置相对快照变了（新加、启用或手改过插件）就先把上次能跑的配置放回去，再重启内核。
+2. **运行时版本回退**：配置没变，说明问题多半不在插件，于是走原来那条「同一运行时连续 2 次失败 →
+   回退到上一版本 / 内置运行时」。这一步发生在动插件之前，正是为了不误伤插件配置。
+3. **安全模式**：只有已经退到不可变的内置运行时、仍然起不来时，才停用第三方 bundle
+   并把该 profile 自己的补丁层清成 `[]`，保证应用至少能打开。
+4. 三步都救不回来，才落到原来那个「启动失败」弹窗。
+
+每一步动手前都会先归因：内核自己报了插件名就用它——`plugin tree failed to load`、
+`plugin(s) failed to load:`、`failed to apply loader entry <行> (<包>)`、
+`cannot resolve profile bundle "..."`、`N entries did not activate`、fatal rejection 的栈；
+内核**一个字都没打印**（卡死那种，也是 vision-toolkit 当初的表现）就退化为
+「对比快照：哪些 bundle / 补丁行是新的或改过的」。
+
+每一步动手之前，当前配置都会先完整备份到
+`%APPDATA%\DeepSeek Harness\profile-guard\backups\<时间戳>\`，里面有一份 `manifest.json`
+写明这次备份的原因、失败详情和当时的插件清单；最多保留最近 20 份，**从不静默丢弃**。
+恢复完成后弹一个非阻塞提示，写明失败原因、疑似元凶、改了哪些文件、备份在哪。
+
+配置回退与安全模式每轮启动各只自动尝试一次，成功启动后计数清零，所以不会陷入反复重启。
+
+### 手动入口
+
+- 「文件」菜单常驻一行 `上次可用配置 · <时间> · <n> 个文件`
+- 「回退到上次可用配置」：把当前配置和快照的差异列清楚，确认后回退并重启内核
+- 「打开配置备份目录」：直接打开备份根目录，坏配置都在里面
+
+### 边界
+
+- 只动上面那几张配置文件：会话、凭据、`profiles/*/node_modules` 一概不碰。
+- 只保护 `dsh web` 用的 `web` profile（外壳只跑这一个）。
+- 回退的是**上次成功启动**的配置。如果那份配置本身是个定时炸弹（启动时正常、跑十分钟才炸），
+  回退救不了它，仍然走「内核进程已退出」的弹窗。
+- 如果插件包已经被 `dsh plugin remove` 卸掉，回退后的 `package.json` 会引用一个装不回来的包，
+  这次回退救不回来，会退到「启动失败」弹窗并给出日志路径。
+
+### 单独验证
+
+```powershell
+npm run test:profile-guard            # 离线用例 + 真内核失败归因
+node scripts/test-profile-guard.mjs --offline   # 只跑离线用例
+```
+
+用例在 `.test-profile-guard/` 里造一个一次性 DSH_HOME，真的用 `runtime/node/node.exe`
+拉起内核去跑「bundles 里写了个没装的包」和「装了一个 init 就抛异常的插件」两种坏配置，
+把内核**真实输出**喂回归因逻辑，因此匹配的是内核实际会打印的东西，而不是源码推测的东西。
+子进程输出走文件描述符而不是管道，所以在受限 shell 里也能跑。
 
 ---
 
