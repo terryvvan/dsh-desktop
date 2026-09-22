@@ -11,3 +11,5 @@ build/icon.ico
 .preview-settings/
 shot.png
 .test-profile-guard/
+.tmp-vision
+.dsh-vision-toolkit
