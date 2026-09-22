@@ -567,6 +567,9 @@ function removeScript() {
     // Stop the observer from putting the bar straight back.
     delete window.__dshbgMenuRedraw;
     window.__dshbgMenuWatch = false;
+    // Tell a still-armed observer that page-menu mode ended on purpose, so it
+    // does not read this removal as damage and draw the bar again.
+    window.__dshbgMenuMode = 'native';
     return 'removed';
   })()`;
 }
@@ -646,14 +649,27 @@ function createDesktopMenu({ contents, getMenu, setChannel, log }) {
       // The page asks for a redraw by logging; the redraw itself is built by the
       // main process, which is the only side that has the menu definition.
       window.__dshbgMenuRedraw = () => console.log(${JSON.stringify(CONSOLE_PREFIX)} + ' redraw');
+      // This script only runs after a successful draw, so the page is in
+      // page-menu mode from here on. removeScript flips it back to 'native';
+      // the mode is what separates "the page broke the bar" from "the shell took
+      // the bar out on purpose". No backticks in this comment: it lives inside a
+      // template literal.
+      window.__dshbgMenuMode = 'page';
       if (window.__dshbgMenuWatch === true) return 'watching';
       window.__dshbgMenuWatch = true;
       let pending = false;
       const observer = new MutationObserver(() => {
-        // Only the bar's absence is interesting, and redrawing on every mutation
-        // would fight whatever is mutating.
-        if (document.getElementById(ID) !== null) return;
-        if (document.getElementById(STYLE_ID) === null) return;  // native menu mode
+        // Damage has two shapes: the bar is gone, or the bar is still on the page
+        // without its stylesheet. The second one is not cosmetic — the bar is a
+        // plain row of links at the end of the document (bottom of the page,
+        // stacked, unclickable) and the old test, which only looked for the bar,
+        // never redrew out of it.
+        const hasBar = document.getElementById(ID) !== null;
+        const hasStyle = document.getElementById(STYLE_ID) !== null;
+        if (hasBar && hasStyle) return;
+        // Redrawing on every mutation would fight whatever is mutating, and in
+        // native menu mode there is nothing to restore.
+        if (window.__dshbgMenuMode !== 'page') return;
         if (pending) return;
         pending = true;
         requestAnimationFrame(() => {

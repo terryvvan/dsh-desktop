@@ -1,4 +1,4 @@
-node_modules/
+﻿node_modules/
 dist/
 dist-rebuild/
 runtime/
@@ -13,3 +13,4 @@ shot.png
 .test-profile-guard/
 .tmp-vision
 .dsh-vision-toolkit
+.tmp-*/
