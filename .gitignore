@@ -13,4 +13,5 @@ shot.png
 .test-profile-guard/
 .tmp-vision
 .dsh-vision-toolkit
+vision-out/
 .tmp-*/
