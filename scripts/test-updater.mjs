@@ -14,6 +14,10 @@
  *   node scripts/test-updater.mjs --check-only probe only, no download
  *   node scripts/test-updater.mjs --boot       also boot the installed runtime and
  *                                              confirm it serves the Web GUI
+ *   node scripts/test-updater.mjs --mirrors    also run the mirror speed test
+ *   node scripts/test-updater.mjs --install 0.1.5-rc.2
+ *                                              install this version even when no
+ *                                              channel offers something newer
  *   node scripts/test-updater.mjs --keep       leave the downloaded runtime in place
  */
 
@@ -33,6 +37,11 @@ const { createRuntimeManager, CHANNELS } = require(path.join(projectRoot, 'elect
 const checkOnly = process.argv.includes('--check-only');
 const keep = process.argv.includes('--keep');
 const boot = process.argv.includes('--boot');
+const mirrors = process.argv.includes('--mirrors');
+const forced = (() => {
+  const at = process.argv.indexOf('--install');
+  return at === -1 ? null : (process.argv[at + 1] ?? null);
+})();
 
 const sandbox = path.join(projectRoot, '.updater-test');
 if (!keep && !checkOnly) rmSync(sandbox, { recursive: true, force: true });
@@ -113,21 +122,104 @@ for (const channel of CHANNELS) {
 }
 check('at least one channel resolved', probes.size > 0);
 
+// ── 1b. mirrors ──────────────────────────────────────────────────────────────
+
+console.log('\n1b. download mirrors');
+const mirrorList = manager.MIRRORS;
+console.log(`  ${mirrorList.map((mirror) => `${mirror.id}${mirror.url === null ? '' : `=${mirror.url}`}`).join('\n  ')}`);
+check(
+  'the mirror list is offered with urls',
+  Array.isArray(mirrorList) && mirrorList.some((mirror) => mirror.id === 'auto') &&
+    mirrorList.filter((mirror) => typeof mirror.url === 'string').length >= 5,
+  `${mirrorList.length} entries`,
+);
+check(
+  'mirrorFor resolves a known id',
+  manager.mirrorFor('huawei').id === 'huawei' && manager.mirrorFor('huawei').url.startsWith('https://'),
+  manager.mirrorFor('huawei').url,
+);
+check('an unknown mirror id falls back to auto', manager.mirrorFor('no-such-mirror').id === 'auto');
+const chosen = await manager.check({ channel: 'next', registryId: 'npmmirror' });
+check(
+  'a check honours the selected mirror',
+  chosen.registryId === 'npmmirror' && chosen.registry === manager.mirrorFor('npmmirror').url,
+  `${chosen.registryId} → ${chosen.registry}`,
+);
+manager.setMirror('huawei');
+check('the selected mirror is persisted', manager.readState().registryId === 'huawei');
+manager.setMirror('auto');
+
+if (mirrors) {
+  console.log('\n1c. mirror speed test (network)');
+  const results = await manager.testMirrors({ timeoutMs: 20000 });
+  for (const result of results) {
+    console.log(
+      `  ${result.id.padEnd(10)} ${result.ok === true ? `${String(result.latencyMs).padStart(5)}ms  ${(result.bytesPerSecond / 1024).toFixed(0).padStart(6)} KB/s` : `ERROR ${result.error}`}`,
+    );
+  }
+  check('at least one mirror answered the speed test', results.some((result) => result.ok === true));
+}
+
 // ── 2/3/4. install, activate, roll back ──────────────────────────────────────
 
 if (checkOnly) {
   console.log('\n--check-only: skipping install/activate/rollback');
 } else {
-  const target = [...probes.values()].find((result) => result.updateAvailable);
+  const target =
+    forced === null
+      ? [...probes.values()].find((result) => result.updateAvailable)
+      : { latest: forced, updateAvailable: true, forced: true };
   if (target === undefined) {
     console.log('\n2. no channel offers a newer version; nothing to install');
   } else {
     console.log(`\n2. install DSH ${target.latest} (this downloads the full runtime)`);
     const started = Date.now();
+    // The progress window is fed by these events, so check the contract here
+    // rather than trusting that the window simply looked busy.
+    const phases = [];
+    const downloads = [];
     const installed = await manager.install(target.latest, {
-      onProgress: ({ phase }) => console.log(`    phase: ${phase}`),
+      onProgress: (progress) => {
+        phases.push(progress.phase);
+        if (progress.phase === 'download') downloads.push(progress);
+        const detail =
+          progress.phase === 'plan'
+            ? ` ${progress.planned}/${progress.total} 个包`
+            : progress.phase === 'download'
+              ? ` ${progress.percent}% ${(progress.bytes / 1048576).toFixed(1)}MB`
+              : '';
+        console.log(`    phase: ${progress.phase}${detail}`);
+      },
     });
     console.log(`    installed in ${((Date.now() - started) / 1000).toFixed(1)}s (reused=${installed.reused})`);
+
+    if (installed.reused === true) {
+      console.log('    (tree already present, so the download path was not exercised)');
+    } else {
+      const seen = new Set(phases);
+      check(
+        'the install walks every advertised phase',
+        ['resolve', 'plan', 'download', 'seed', 'install', 'verify', 'activate'].every((phase) => seen.has(phase)),
+        [...seen].join(' → '),
+      );
+      const plan = phases.filter((phase) => phase === 'plan').length;
+      const last = downloads.at(-1);
+      check(
+        'the plan phase reports how many tarballs it measured',
+        plan > 1 && downloads.length > 1,
+        `${plan} plan events, ${downloads.length} download events`,
+      );
+      check(
+        'the download reports a real, complete progress snapshot',
+        last !== undefined &&
+          last.percent === 100 &&
+          last.bytes === last.totalBytes &&
+          last.files === last.totalFiles &&
+          Number.isFinite(last.speed) &&
+          last.paused === false,
+        last === undefined ? 'no download events' : `${last.files}/${last.totalFiles} files, ${(last.bytes / 1048576).toFixed(1)}MB, ${(last.speed / 1048576).toFixed(2)}MB/s`,
+      );
+    }
 
     const resolved = manager.resolve();
     check('shell resolves the installed tree', resolved.source === 'installed', resolved.root);

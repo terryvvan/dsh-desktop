@@ -31,15 +31,24 @@ function context(pageMenuBar) {
   return {
     runtimeManager: {
       CHANNELS: ['latest', 'next', 'alpha'],
+      MIRRORS: [
+        { id: 'auto', label: '自动（跟随 ~/.npmrc）', url: null, hint: '用系统 npm 配置里的 registry' },
+        { id: 'npmmirror', label: '淘宝 npmmirror', url: 'https://registry.npmmirror.com/', hint: '国内最快，推荐' },
+        { id: 'npmjs', label: 'npm 官方', url: 'https://registry.npmjs.org/', hint: '海外直连' },
+      ],
       describe: () => ({
         active: '0.1.5-rc.2',
         bundled: '0.1.5-rc.2',
         source: 'bundled',
         channel: 'next',
+        registryId: 'auto',
         previous: null,
         installed: [],
         lastCheck: null,
       }),
+      mirrorFor: (id) => ({ id: id ?? 'auto', label: '自动（跟随 ~/.npmrc）', url: null, hint: '' }),
+      setMirror: (id) => ({ id, label: id, url: null, hint: '' }),
+      testMirrors: async () => [],
       writeState: () => {},
     },
     profileGuard: { hasSnapshot: () => false, describeSnapshot: () => '配置快照：无', backupRoot: () => 'x' },
@@ -54,6 +63,16 @@ function context(pageMenuBar) {
     setChannel: () => {},
     manualProfileRollback: () => {},
     manualCheck: () => {},
+    isCheckingUpdate: () => false,
+    isUpdating: () => false,
+    mirrors: () => [
+      { id: 'auto', label: '自动（跟随 ~/.npmrc）', url: null, hint: '' },
+      { id: 'npmmirror', label: '淘宝 npmmirror', url: 'https://registry.npmmirror.com/', hint: '' },
+    ],
+    registryId: () => 'auto',
+    setMirror: () => {},
+    testMirrors: () => {},
+    showUpdateProgress: () => {},
     doRollback: () => {},
     showAbout: () => {},
     rebuildMenu: () => {},
@@ -79,7 +98,6 @@ async function main() {
       }
       if (item.info === true) continue;
       if (item.id === undefined) missing.push(`${trail}: no id`);
-      else if (item.id.startsWith('channel:')) continue;
       else if (built.commands[item.id] === undefined) missing.push(`${trail}: unknown id ${item.id}`);
     }
   };

@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; style-src 'unsafe-inline'; script-src 'self'"
+    />
+    <title>DSH 更新</title>
+    <style>
+      * { box-sizing: border-box; }
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: #1b1c1f;
+        color: #eceef2;
+        font: 13px/1.6 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+        user-select: none;
+        overflow: hidden;
+      }
+      body { display: flex; flex-direction: column; }
+
+      main {
+        flex: 1;
+        min-height: 0;
+        overflow-y: auto;
+        scrollbar-gutter: stable;
+        padding: 16px 20px 0;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
+      main::-webkit-scrollbar { width: 10px; }
+      main::-webkit-scrollbar-thumb {
+        background: #3a3f49;
+        border-radius: 5px;
+        border: 2px solid #1b1c1f;
+      }
+      main::-webkit-scrollbar-track { background: transparent; }
+
+      h1 { margin: 0; font-size: 15px; font-weight: 600; letter-spacing: 0.2px; }
+      .sub { margin: 2px 0 0; font-size: 12px; color: #868d9b; }
+
+      .card {
+        border: 1px solid #2c2f36;
+        border-radius: 10px;
+        background: #202226;
+        padding: 12px 14px;
+      }
+      .card > h2 {
+        margin: 0 0 8px;
+        font-size: 11px;
+        font-weight: 600;
+        letter-spacing: 0.6px;
+        text-transform: uppercase;
+        color: #868d9b;
+      }
+
+      /* ── progress ─────────────────────────────────────────────────────── */
+      .headline { display: flex; align-items: baseline; gap: 10px; }
+      .percent { font-size: 26px; font-weight: 600; font-variant-numeric: tabular-nums; }
+      .phaseLabel { font-size: 12.5px; color: #cfd4de; }
+      .bar {
+        position: relative;
+        height: 8px;
+        border-radius: 4px;
+        background: #2a2d33;
+        overflow: hidden;
+        margin: 10px 0 8px;
+      }
+      #barFill {
+        height: 100%;
+        width: 0%;
+        border-radius: 4px;
+        background: linear-gradient(90deg, #3f7d5a, #67c08c);
+        transition: width 180ms linear;
+      }
+      .bar.indeterminate #barFill {
+        width: 30% !important;
+        animation: slide 1.1s ease-in-out infinite;
+      }
+      @keyframes slide {
+        0% { margin-left: -30%; }
+        100% { margin-left: 100%; }
+      }
+      .stats {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 4px 14px;
+        font-size: 12px;
+        color: #a9b0bd;
+        font-variant-numeric: tabular-nums;
+      }
+      .current {
+        margin-top: 6px;
+        font-size: 11.5px;
+        color: #868d9b;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      /* ── phase timeline ───────────────────────────────────────────────── */
+      ol.steps { list-style: none; margin: 0; padding: 0; }
+      ol.steps li {
+        display: flex;
+        align-items: baseline;
+        gap: 8px;
+        padding: 3px 0;
+        font-size: 12.5px;
+        color: #79808e;
+      }
+      ol.steps li .dot {
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: #3a3f49;
+        flex: 0 0 auto;
+        transform: translateY(-1px);
+      }
+      ol.steps li .when { margin-left: auto; font-size: 11.5px; color: #6d7480; font-variant-numeric: tabular-nums; }
+      ol.steps li.active { color: #eceef2; }
+      ol.steps li.active .dot { background: #67c08c; box-shadow: 0 0 0 3px rgba(103, 192, 140, 0.16); }
+      ol.steps li.done { color: #9aa3b0; }
+      ol.steps li.done .dot { background: #3f7d5a; }
+      ol.steps li.error { color: #ffb4a8; }
+      ol.steps li.error .dot { background: #d9634f; }
+
+      /* ── notices ──────────────────────────────────────────────────────── */
+      .notice {
+        border: 1px solid #4a3a35;
+        background: #2a2220;
+        color: #ffc9bd;
+        border-radius: 8px;
+        padding: 9px 11px;
+        font-size: 12px;
+        word-break: break-word;
+      }
+      .notice.info {
+        border-color: #2f4a3c;
+        background: #1e2a24;
+        color: #a8e0bd;
+      }
+      .hidden { display: none !important; }
+
+      /* ── interactive ──────────────────────────────────────────────────── */
+      .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+      .row > .grow { flex: 1; min-width: 0; }
+      label.field { font-size: 11.5px; color: #868d9b; }
+      select {
+        appearance: none;
+        background: #262a30;
+        color: #eceef2;
+        border: 1px solid #343943;
+        border-radius: 7px;
+        padding: 6px 9px;
+        font: inherit;
+        font-size: 12.5px;
+        min-width: 210px;
+      }
+      button {
+        background: #2b3038;
+        color: #eceef2;
+        border: 1px solid #383e49;
+        border-radius: 7px;
+        padding: 6px 12px;
+        font: inherit;
+        font-size: 12.5px;
+        cursor: pointer;
+      }
+      button:hover:not(:disabled) { background: #333942; }
+      button.primary { background: #2f6a4c; border-color: #3d825d; }
+      button.primary:hover:not(:disabled) { background: #377a58; }
+      button.danger { background: #432a28; border-color: #5b3934; color: #ffc9bd; }
+      button:disabled { opacity: 0.45; cursor: default; }
+
+      table.speed { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 12px; }
+      table.speed th,
+      table.speed td { text-align: left; padding: 3px 6px; color: #a9b0bd; }
+      table.speed th { color: #79808e; font-weight: 500; font-size: 11px; }
+      table.speed td.num { text-align: right; font-variant-numeric: tabular-nums; }
+      table.speed tr.best td { color: #a8e0bd; }
+
+      /* ── installer log ────────────────────────────────────────────────── */
+      pre#log {
+        margin: 0;
+        max-height: 132px;
+        overflow-y: auto;
+        font: 11.5px/1.5 "Cascadia Mono", Consolas, monospace;
+        color: #9aa3b0;
+        white-space: pre-wrap;
+        word-break: break-all;
+        user-select: text;
+      }
+      pre#log::-webkit-scrollbar { width: 8px; }
+      pre#log::-webkit-scrollbar-thumb { background: #3a3f49; border-radius: 4px; }
+
+      /* ── footer ───────────────────────────────────────────────────────── */
+      footer {
+        flex: 0 0 auto;
+        padding: 10px 20px 14px;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        border-top: 1px solid #26292f;
+        background: #1b1c1f;
+      }
+      footer .spacer { flex: 1; }
+      footer .hint { font-size: 11.5px; color: #6d7480; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div>
+        <h1 id="title">正在更新 DSH</h1>
+        <p class="sub" id="subtitle">准备中…</p>
+      </div>
+
+      <section class="card">
+        <div class="headline">
+          <span class="percent" id="percent">—</span>
+          <span class="phaseLabel" id="phaseLabel">准备中</span>
+        </div>
+        <div class="bar" id="bar"><div id="barFill"></div></div>
+        <div class="stats" id="stats"></div>
+        <div class="current" id="currentFile"></div>
+      </section>
+
+      <div class="notice hidden" id="error"></div>
+      <div class="notice info hidden" id="info"></div>
+
+      <section class="card">
+        <h2>阶段</h2>
+        <ol class="steps" id="steps"></ol>
+      </section>
+
+      <section class="card">
+        <h2>镜像源</h2>
+        <div class="row">
+          <label class="field" for="mirror">下载源</label>
+          <select id="mirror"></select>
+          <button id="speedTest">测速并推荐</button>
+        </div>
+        <div id="speedResults"></div>
+        <div class="current" id="mirrorHint">国内镜像通常比官方源快数倍；切换后检查更新与下载都会走该镜像。</div>
+      </section>
+
+      <section class="card">
+        <h2>安装日志</h2>
+        <pre id="log"></pre>
+      </section>
+    </main>
+
+    <footer>
+      <button id="pause" class="hidden">暂停</button>
+      <button id="cancel" class="hidden danger">取消下载</button>
+      <button id="retry" class="hidden">重试（保留已下载内容）</button>
+      <button id="restart" class="hidden primary">立即重启内核</button>
+      <button id="later" class="hidden">稍后</button>
+      <button id="openLog" class="hidden">打开日志目录</button>
+      <span class="spacer"></span>
+      <span class="hint" id="hint"></span>
+      <button id="close">关闭</button>
+    </footer>
+
+    <script src="update-ui.js"></script>
+  </body>
+</html>

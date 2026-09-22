@@ -53,13 +53,17 @@ desktop/
   package.json              electron-builder 配置（在 "build" 字段里）
   electron/
     main.js                 主进程：拉起内核、解析地址、窗口与菜单生命周期
-    updater.js              版本检测、运行时安装、原子切换、失败回滚
+    updater.js              版本检测、运行时安装、原子切换、失败回滚；更新镜像源与测速
+    tarball-cache.js        tarball 下载器（Range 续传、完整性校验、镜像回退、暂停/取消）与 cacache 播种
     profile-guard.js        配置快照、失败归因、回退上次可用配置、安全模式
     background.js           背景（图片/动图/视频）与界面透明度：dshbg:// 协议、播放器与样式注入、设置持久化
     desktop-menu.js         应用菜单：一份定义同时生成原生菜单与页面内菜单栏，以及它们的点击回传
     check-menu.cjs          校验菜单定义与原生模板能对得上（放在 electron/ 里，所以打包后也能跑）
     background.html/-ui.js  背景设置窗口及其渲染逻辑
     preload.js              仅供背景设置窗口使用的 contextBridge 桥接
+    update-window.js        更新进度窗口：状态推送、动作回传、关窗不取消安装
+    update.html/-ui.js      更新进度窗口的界面与渲染逻辑
+    update-preload.js       仅供更新窗口使用的 contextBridge 桥接（dshUpdate）
     splash.html             内核引导期间的启动画面
     logo.svg                DSH 官方鲸鱼标识（由 prepare:runtime 从运行时里拷出来）
   docs/plans/               设计文档
@@ -67,7 +71,10 @@ desktop/
     prepare-runtime.ps1     生成 runtime/（自带 node.exe + npm + 生产版 DSH）
     fetch-electron.mjs      下载并解包 Electron 二进制
     make-icon.mjs           用官方标识渲染 build/icon.png 和 build/icon.ico
-    test-updater.mjs        不开 Electron 直接验证整条更新链路
+    test-updater.mjs        不开 Electron 直接验证整条更新链路（--install 可强制指定版本）
+    test-tarball-cache.mjs  下载器：真实 registry + 本地慢速 registry 验暂停/取消/续传
+    test-update-window.cjs  进度窗口：快照渲染、按钮过桥、关窗不取消（需 Electron）
+    test-page-menu.cjs      页面内菜单栏：二级浮窗不叠加、子项都带命令、点击过桥（需 Electron）
     preview-background.cjs  用真实 DSH 页面渲染背景/透明度效果图，核对观感；多帧模式可判断背景是否真的在动
     test-profile-guard.mjs  配置回退：离线用例 + 真内核失败归因
   runtime/                  ← 生成物，随安装包分发（约 315 MB）
@@ -188,6 +195,7 @@ npm run dist                   # 产出安装包 + 绿色版
 - **页面菜单栏没有 IPC 通道。** 主窗口照旧不挂载 preload，注入的菜单只能往自己的控制台写一行 `dshbg-menu: run <id>`，主进程监听这个前缀。它是单向的纯文本通道，只能点名菜单里已经有的 id——比开一条 IPC 桥小得多：插件本来就能 `console.log`，而它能做到的最坏情况只是触发一个用户本来就能点的菜单项。菜单栏本身挂在 `<html>` 而不是 `<body>` 上，因为 body 的子节点归 DSH 的框架所有，会被它 reconcile 掉。
 - `scripts/preview-background.cjs` 把真实 DSH 页面渲染成 PNG，用来核对观感（用法见脚本头部注释）。多帧模式会对比相邻截图，用来判断背景是否真的在动；`PREVIEW_VIDEO` 指向一个真实视频文件即可跑完整条视频链路；`PREVIEW_RESIZE_REPEAT` 连做设置更新与窗口拖动，用来验证窗口尺寸不会漂；`PREVIEW_MENU=page` 用**壳自己的菜单定义**装上页面菜单栏，检查它是否铺到背景、是否把应用顶下去却不产生滚动条、被删掉后能否自愈、点击是否回到主进程；`PREVIEW_CLOSE_SETTINGS` 打开再关闭设置窗口，并用 `GetForegroundWindow` 采样确认前台交还给了主窗口。（早先菜单用的是替身定义，结果把 `getMenu` 的接线整个绕过去了——替身会让「画得出来」和「接线正确」分开，而后者才是实机上唯一会错的地方。）
 - `electron/check-menu.cjs` 是菜单的廉价回归检查：`buildMenu` 在启动路径上，定义写错会让应用根本起不来，所以它用替身构造一遍菜单、转成原生模板并核对两边的项能对上、role 一个不少。不需要启动内核。
+- **二级菜单在任何时候都只有一个。** 子面板挂在它自己的那一行上（`row.appendChild(sub)`），所以「清掉上一个浮窗」必须按**所有后代**匹配（`panel.querySelectorAll('.panel')`），不能用 `:scope > .panel`——它只会看直接子节点，看不见挂在行里的子面板，于是鼠标每进出一次就多叠一个浮窗。现在每一行（不管有没有子菜单）在 `mouseenter` 时都会先清空本面板的子面板，有子项的行再建自己的那个：从二级项移到普通行也会把浮窗收掉。`scripts/test-page-menu.cjs` 专门钉住这条（用旧选择器跑会看到 6 次悬停留下 6 个浮窗，`total` 在第二个子菜单参与后涨到 12）。
 
 ### 局限
 
@@ -205,8 +213,9 @@ npm run dist                   # 产出安装包 + 绿色版
 
 ```
 %APPDATA%\DeepSeek Harness\
-    runtime-state.json          通道、当前版本、连续启动失败次数
+    runtime-state.json          通道、下载镜像、当前版本、连续启动失败次数
     runtimes\0.1.6-alpha.2\     下载安装的运行时
+    update-cache\tarballs\      自己下载的 tarball（`.part` 是未完成的，可续传）
     npm-cache\                  内置 npm 的缓存
 ```
 
@@ -234,13 +243,58 @@ npm run dist                   # 产出安装包 + 绿色版
 - 启动后静默检查一次，有新版才弹窗（「下载并安装 / 稍后 / 忽略此版本」）
 - 菜单「文件 → 检查更新…」随时手动检查，会显示当前版本、通道和所有通道的解析结果
 - 菜单顶部常驻一行 `当前 DSH <版本> · 内置/已安装`，是当前运行版本的可信来源
-- 下载在后台进行，用任务栏进度条提示，**不打断正在进行的会话**
+- **前提是能看到进度**：菜单「文件 → 检查更新…」找到新版后开「更新进度」窗口（见下），
+  任务栏进度条同步显示确定百分比，安装**不打断正在进行的会话**
 
-### 下载与安装交给内置 npm
+### 更新进度窗口
 
-版本查询和安装都走随包的 npm CLI，而不是自己实现 registry 访问。理由是：npm 已经会读取用户自己的 registry、代理和 TLS 配置——在公共 registry 不可达的机器上（本机就是），那套配置是唯一能用的东西。安装用 `--ignore-scripts`，因为 DSH 的原生依赖把预编译二进制直接打在 tarball 里。
+`electron/update-window.js` + `update.html` + `update-preload.js`，一个独立的非模态小窗（560×620，
+可最小化、关掉不取消安装；主窗口菜单的「更新进度…」随时能把它叫回来）：
 
-安装完成后会逐项校验：入口文件、Web 前端产物、以及 `dsh` / `dsh-web-app` / `dsh-web-frontend` 三者版本是否一致（不一致说明 npm 解出了混版树，拒绝激活）。
+- 阶段时间线：解析依赖树 → 探测下载体积 → 下载 tarball → 写入 npm 缓存 → 离线安装 → 校验 → 切换
+- 下载阶段是**真百分比**：`已下载/总量 · 包数 · 速度 · 剩余约 X · 已用 Y`，另有实时 npm 输出尾巴
+- 按钮：下载中「暂停 / 取消」→ 暂停后「继续」；失败「重试（保留已下载内容）/ 打开日志目录」；
+  就绪「立即重启内核 / 稍后」
+- 失败与取消都会把最后几行错误留在窗口里，`desktop.log` 同时留有 `update: …` 行
+
+「暂停」是真的停：pipeline 中断在 chunk 边界，`.part` 留在磁盘上；「继续」用
+`Range: bytes=<已下载>-` 续传（服务端不支持时自动从头下）。Windows 上没有 SIGSTOP，
+所以暂停靠的是我们自己的下载循环，而不是给 npm 发信号。
+
+### 更新镜像源
+
+菜单「文件 → 更新镜像源」里切换，选择存在 `runtime-state.json` 的 `registryId`：
+
+| id | 镜像 | 地址 |
+| --- | --- | --- |
+| `auto` | 跟随 npm 配置（`~/.npmrc`） | — |
+| `npmmirror` | 淘宝 npmmirror | `https://registry.npmmirror.com/` |
+| `tencent` | 腾讯云 | `https://mirrors.cloud.tencent.com/npm/` |
+| `huawei` | 华为云 | `https://repo.huaweicloud.com/repository/npm/` |
+| `tuna` | 清华 TUNA | `https://mirrors.tuna.tsinghua.edu.cn/npm/` |
+| `ustc` | 中科大 USTC | `https://npmreg.proxy.ustclug.org/` |
+| `npmjs` | npm 官方 | `https://registry.npmjs.org/` |
+
+选中的镜像以 `npm_config_registry` 传给内置 npm（**优先级高于 `~/.npmrc`**），版本探测、依赖解析和
+安装都用它；选 `auto` 就是完全不干预。更新窗口里的「测速」会并发拉各镜像的 packument，按吞吐排序，
+顺便给出推荐项。单个 tarball 失败时还会按镜像列表回退重试，不必整轮重来。
+
+### 下载是自己下的，安装仍交给内置 npm
+
+版本查询和依赖解析仍走随包的 npm CLI：它会读取用户自己的 registry、代理和 TLS 配置——在公共 registry
+不可达的机器上，那套配置是唯一能用的东西。但**下载不再交给 npm**：
+
+1. `npm install --package-lock-only` 拿到完整依赖树（含 `resolved` + `integrity`），按平台过滤 optional
+2. 自研下载器（`electron/tarball-cache.js`）并发拉取 tarball：`Range` 续传、sha512 校验、镜像回退
+3. 校验通过的 tarball 用 `cacache.put.stream` 播种进 npm 缓存（cacache 不在时回退 `npm cache add`）
+4. `npm install --prefer-offline --ignore-scripts` 从缓存离线安装
+5. 逐项校验入口文件、Web 前端产物、以及 `dsh` / `dsh-web-app` / `dsh-web-frontend` 版本一致性，再原子切换
+
+自己做下载的唯一理由是**可观测**：npm 把 stdout 缓到进程结束，中途没有任何数字，长安装期间用户只能看着
+一个不确定进度条。一次 0.1.6-alpha.2 安装约 **520 个 tarball / 一百多 MB**，旧路径全程 ~104 秒零输出。
+`--ignore-scripts` 是因为 DSH 的原生依赖把预编译二进制直接打在 tarball 里。
+
+失败或取消只删 `.staging-<version>-<pid>`，**已下载的 tarball 保留**，所以「重试」几乎立刻就能装完。
 
 ### 失败回滚
 
@@ -253,9 +307,15 @@ npm run dist                   # 产出安装包 + 绿色版
 ```powershell
 npm run test:updater          # 探测通道 → 安装 → 启动探测 → 回滚，全程不开 Electron
 npm run test:updater:check    # 只探测通道，不下载
+node scripts/test-updater.mjs --install 0.1.5-rc.2   # 强制装某个版本（通道没新版本时也能验下载器）
+node scripts/test-updater.mjs --mirrors              # 顺带跑一遍镜像测速
+npm run test:tarball-cache    # 下载器本身：真实 registry + 本地慢速 registry（暂停/取消/续传）
+npm run test:update-window    # 进度窗口：快照渲染、按钮过桥、关窗不取消（需要 Electron）
 ```
 
-这个脚本用真实的打包运行时和一次性的用户目录，跑的是应用本身的那套代码，因此可以在打包前就把问题挡住。
+前两个用真实的打包运行时和一次性的用户目录，跑的是应用本身的那套代码，因此可以在打包前就把问题挡住。
+`test-updater` 的安装步骤会顺手校验进度契约（阶段齐全、最后一个下载快照必须是 `percent=100` 且
+`bytes===totalBytes`），因为进度窗口就是喂这些事件的。
 
 ---
 
@@ -363,6 +423,19 @@ runtime ready at http://127.0.0.1:45743/?token=...        ← 约 13 秒
 | **装回来的 alpha 运行时能真正跑起来** | ✅ 启动并返回 `HTTP 303 → 200`，含 `__DSH_BOOT__`，31188 字节 |
 | 连续失败才回滚 | ✅ 第 1 次失败不回滚，第 2 次回退到内置并写入 `skippedVersion` |
 | 手动回退 | ✅ 回到内置运行时 |
+
+新下载路径、进度窗口与镜像（`npm run test:tarball-cache` / `npm run test:update-window`，都不开 Electron 或用一次性 Electron 窗口）：
+
+| 检查项 | 结果 |
+| --- | --- |
+| tarball 下载器 | ✅ 12/12：体积测量（4.0 MB typescript）、真实下载 + 完整性校验、错误 integrity 被拒、无 controller 的调用者也能下载 |
+| 暂停 / 取消 / 续传 | ✅ 暂停停在首字节前（1.2 秒内 0 字节）、取消抛 `UpdateCancelledError` 且保留 `.part`（576 KB）、重试发出 `Range: bytes=589817-` 得到 `206` 并补齐 8 MB |
+| 镜像改写 | ✅ `npmmirror` → `repo.huaweicloud.com/repository/npm/…` |
+| 整条新下载路径（`node scripts/test-updater.mjs --install 0.1.5-rc.2`） | ✅ exit 0：**65.9 秒**装完，阶段齐全 `resolve → plan → download → seed → install → verify → activate`；521 次体积探测、**520/520 个 tarball / 52.1 MB / 6.49 MB/s**（下载本身 11 秒，其余时间在播种缓存与离线安装），装回的运行时能真正启动，内置树未被改动 |
+| 当前源码的隔离启动（dev 模式，一次性 `DSH_HOME` + `--user-data-dir`） | ✅ `shell 0.1.5 starting` → `booting DSH 0.1.5-rc.2 (内置)` → 27 秒后 `runtime ready at http://127.0.0.1:6248/`，`profile-guard: snapshot saved`，无错误行 ⇒ 新的 `menuContext()` 字段与 `createUpdateWindow` 接线在真实启动路径上不会抛错 |
+| 进度窗口 | ✅ 9/9：快照渲染、进度条 25%、阶段列表、npm 日志尾巴、按钮过 preload 桥、**关窗后 `isBusy` 仍为 true**、失败可重试、就绪可重启 |
+| 菜单定义 | ✅ `electron/check-menu.cjs` exit 0：`update-progress`、`mirror:*`、`mirror-speed-test` 都能映射到命令 |
+| 页面菜单栏的二级浮窗 | ✅ `npm run test:page-menu` 10/10：悬停「更新通道」「更新镜像源」各 6 次都只留 1 个二级浮窗、移到普通行会收起、两个二级菜单之间只留最后一个、点二级项仍过桥并关闭菜单（同一脚本在旧的 `:scope > .panel` 选择器下会失败：6 次悬停 → 6 个浮窗） |
 
 打包产物（`dist/win-unpacked/DeepSeekHarness.exe`）两条解析路径都实测过：
 

@@ -17,26 +17,59 @@
  *   <userData>/runtime-state.json        channel, active version, failure count
  *   <userData>/runtimes/<version>/       an installed runtime tree
  *   <userData>/npm-cache/                the bundled npm's cache
+ *   <userData>/update-cache/tarballs/    tarballs fetched by the downloader
  *
  * Both the version probe and the install are delegated to the bundled npm CLI
  * rather than reimplemented here. That is deliberate: npm already honours the
  * user's registry, proxy and TLS configuration, and on machines where the
  * public registry is unreachable that configuration is the only thing that
  * works.
+ *
+ * The *download* is the one thing npm does not do for us: it is handled by
+ * `electron/tarball-cache.js`, which streams tarballs into npm's cache with real
+ * progress, resumable `.part` files and mirror failover. The install then runs
+ * offline, so a slow network can no longer turn into a half-installed runtime.
  */
 
 const fs = require('node:fs');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
+const { pipeline } = require('node:stream/promises');
+const {
+  downloadAll,
+  planSizes,
+  fileNameFor,
+  formatBytes,
+  formatDuration,
+  UpdateCancelledError,
+} = require('./tarball-cache');
 
 const DSH_PACKAGE = '@deepseek-ai/dsh';
 /** Selectable update channels, mapped onto npm dist-tags. */
 const CHANNELS = ['next', 'alpha', 'latest'];
 const DEFAULT_CHANNEL = 'next';
+/**
+ * Registries offered in the UI. `url: null` means "leave npm alone", i.e. use
+ * whatever the machine's own npm configuration (`.npmrc`, proxy, mirror) says.
+ */
+const MIRRORS = [
+  { id: 'auto', label: '跟随 npm 配置（~/.npmrc）', url: null, hint: '使用本机 npm 自己的 registry' },
+  { id: 'npmmirror', label: '淘宝 npmmirror', url: 'https://registry.npmmirror.com/', hint: '国内镜像，通常最快' },
+  { id: 'tencent', label: '腾讯云', url: 'https://mirrors.cloud.tencent.com/npm/', hint: '国内镜像' },
+  { id: 'huawei', label: '华为云', url: 'https://repo.huaweicloud.com/repository/npm/', hint: '国内镜像' },
+  { id: 'tuna', label: '清华 TUNA', url: 'https://mirrors.tuna.tsinghua.edu.cn/npm/', hint: '教育网镜像' },
+  { id: 'ustc', label: '中科大 USTC', url: 'https://npmreg.proxy.ustclug.org/', hint: '教育网镜像' },
+  { id: 'npmjs', label: 'npm 官方', url: 'https://registry.npmjs.org/', hint: '海外官方源' },
+];
+const DEFAULT_MIRROR_ID = 'auto';
 /** Boot failures on an installed runtime before it is rolled back. */
 const BOOT_FAILURE_LIMIT = 2;
 const PROBE_TIMEOUT_MS = 60000;
 const INSTALL_TIMEOUT_MS = 45 * 60 * 1000;
+/** Resolving the dependency tree is metadata-only; it is still worth a ceiling. */
+const RESOLVE_TIMEOUT_MS = 10 * 60 * 1000;
+/** Downloaded tarballs older than this are dropped after a successful install. */
+const TARBALL_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
 // ─── version comparison ──────────────────────────────────────────────────────
 // Small SemVer subset: enough to order `0.1.5-rc.2` against `0.1.6-alpha.2`,
@@ -160,6 +193,8 @@ function createRuntimeManager({ bundledRuntimeDir, userDataDir, log }) {
   const npmCli = path.join(bundledRuntimeDir, 'node', 'node_modules', 'npm', 'bin', 'npm-cli.js');
   const runtimesDir = path.join(userDataDir, 'runtimes');
   const cacheDir = path.join(userDataDir, 'npm-cache');
+  const updateCacheDir = path.join(userDataDir, 'update-cache');
+  const tarballsDir = path.join(updateCacheDir, 'tarballs');
   const stateFile = path.join(userDataDir, 'runtime-state.json');
 
   // ── state ──────────────────────────────────────────────────────────────────
@@ -168,6 +203,9 @@ function createRuntimeManager({ bundledRuntimeDir, userDataDir, log }) {
     const stored = readJson(stateFile) ?? {};
     return {
       channel: CHANNELS.includes(stored.channel) ? stored.channel : DEFAULT_CHANNEL,
+      registryId: MIRRORS.some((mirror) => mirror.id === stored.registryId)
+        ? stored.registryId
+        : DEFAULT_MIRROR_ID,
       autoCheck: stored.autoCheck !== false,
       activeVersion: typeof stored.activeVersion === 'string' ? stored.activeVersion : null,
       previousVersion: typeof stored.previousVersion === 'string' ? stored.previousVersion : null,
@@ -248,7 +286,18 @@ function createRuntimeManager({ bundledRuntimeDir, userDataDir, log }) {
 
   // ── update checks ──────────────────────────────────────────────────────────
 
-  function npmEnv() {
+  /** The mirror record for an id, falling back to the saved one. */
+  function mirrorFor(registryId) {
+    const id = MIRRORS.some((mirror) => mirror.id === registryId) ? registryId : readState().registryId;
+    return MIRRORS.find((mirror) => mirror.id === id) ?? MIRRORS[0];
+  }
+
+  /** The registry URL to hand npm, or null to leave the machine's npm alone. */
+  function registryUrlFor(registryId) {
+    return mirrorFor(registryId).url;
+  }
+
+  function npmEnv(registry) {
     const env = { ...process.env };
     for (const key of Object.keys(env)) {
       if (key.startsWith('ELECTRON_')) delete env[key];
@@ -259,6 +308,12 @@ function createRuntimeManager({ bundledRuntimeDir, userDataDir, log }) {
     env.npm_config_update_notifier = 'false';
     env.npm_config_fund = 'false';
     env.npm_config_audit = 'false';
+    if (typeof registry === 'string' && registry !== '') {
+      // An explicit registry beats ~/.npmrc (npm's own precedence for
+      // npm_config_registry), which is what makes the mirror switch take effect
+      // for both the probe and the install.
+      env.npm_config_registry = registry;
+    }
     return env;
   }
 
@@ -271,16 +326,17 @@ function createRuntimeManager({ bundledRuntimeDir, userDataDir, log }) {
   }
 
   /** Read the channel's target version from the registry's dist-tags. */
-  async function check({ channel } = {}) {
+  async function check({ channel, registryId } = {}) {
     assertBundledNpm();
     const state = readState();
     const useChannel = CHANNELS.includes(channel) ? channel : state.channel;
+    const mirror = mirrorFor(registryId);
     const current = resolve().version;
 
     const result = await run(
       nodeExe,
       [npmCli, 'view', DSH_PACKAGE, 'dist-tags', '--json'],
-      { env: npmEnv(), timeoutMs: PROBE_TIMEOUT_MS },
+      { env: npmEnv(mirror.url), timeoutMs: PROBE_TIMEOUT_MS },
     );
     if (result.code !== 0) {
       const detail = result.stderr.trim().split(/\r?\n/).slice(0, 3).join(' ');
@@ -301,7 +357,16 @@ function createRuntimeManager({ bundledRuntimeDir, userDataDir, log }) {
       current !== null && compareVersions(latest, current) > 0 && latest !== state.skippedVersion;
 
     const next = writeState({ channel: useChannel, lastCheck: new Date().toISOString() });
-    return { channel: useChannel, current, latest, updateAvailable, tags, state: next };
+    return {
+      channel: useChannel,
+      current,
+      latest,
+      updateAvailable,
+      tags,
+      registryId: mirror.id,
+      registry: mirror.url,
+      state: next,
+    };
   }
 
   // ── installation ───────────────────────────────────────────────────────────
@@ -315,20 +380,157 @@ function createRuntimeManager({ bundledRuntimeDir, userDataDir, log }) {
   }
 
   /**
-   * Install `version` into the runtime store and switch to it.
-   * Reuses an already-installed tree, so a rollback-then-reinstall is cheap.
+   * Resolve the dependency tree without downloading it, so the downloader knows
+   * exactly which tarballs the install needs. `--package-lock-only` fetches
+   * metadata only; the tarballs are ours to fetch.
+   * @returns {Array<{name: string, version: string, url: string, integrity?: string}>}
    */
-  async function install(version, { onProgress = () => {} } = {}) {
+  async function resolveTree(staging, registry, { write, controller }) {
+    const result = await run(
+      nodeExe,
+      [
+        npmCli,
+        'install',
+        '--package-lock-only',
+        '--omit=dev',
+        '--ignore-scripts',
+        '--no-audit',
+        '--no-fund',
+        '--loglevel=error',
+      ],
+      { cwd: staging, env: npmEnv(registry), timeoutMs: RESOLVE_TIMEOUT_MS },
+    );
+    controller?.throwIfCancelled();
+    if (result.code !== 0) {
+      const detail = result.stderr.trim().split(/\r?\n/).slice(-4).join(' ');
+      throw new Error(`解析依赖树失败（npm ${result.code}）：${detail}`);
+    }
+
+    const lock = readJson(path.join(staging, 'package-lock.json'));
+    if (lock === null || typeof lock.packages !== 'object' || lock.packages === null) {
+      throw new Error('npm 未生成 package-lock.json，无法得到下载清单');
+    }
+    const entries = [];
+    for (const [key, meta] of Object.entries(lock.packages)) {
+      if (key === '' || meta === null || typeof meta !== 'object') continue;
+      if (meta.link === true || meta.dev === true) continue;
+      // Optional dependencies that cannot run on this platform are skipped:
+      // they would add hundreds of megabytes for nothing, and npm would not
+      // install them anyway. Matching ones are kept, because npm will.
+      if (meta.optional === true && !matchesPlatform(meta)) continue;
+      if (typeof meta.resolved !== 'string' || !/^https?:/.test(meta.resolved)) continue;
+      if (typeof meta.version !== 'string') continue;
+      entries.push({
+        name: key.replace(/^.*node_modules\//, ''),
+        version: meta.version,
+        url: meta.resolved,
+        integrity: typeof meta.integrity === 'string' ? meta.integrity : undefined,
+        size: null,
+      });
+    }
+    if (entries.length === 0) throw new Error('npm 解析出的依赖清单为空');
+    return entries;
+  }
+
+  /**
+   * Store the downloaded tarballs in npm's content-addressed cache, so the
+   * install finds them locally and never touches the network. Falls back to
+   * `npm cache add` (one process per tarball) if the bundled cacache cannot be
+   * loaded.
+   */
+  async function seedCache(files, { write, onProgress, controller }) {
+    const cacache = loadCacache();
+    const cachePath = path.join(cacheDir, '_cacache');
+    let done = 0;
+    for (const file of files) {
+      controller?.throwIfCancelled();
+      await controller?.waitWhilePaused();
+      if (cacache !== null) {
+        try {
+          const integrity = typeof file.integrity === 'string' ? file.integrity : '';
+          if (integrity !== '') {
+            const present = await cacache.get.hasContent(cachePath, integrity).catch(() => null);
+            if (present !== null && present !== undefined && present !== false) {
+              done += 1;
+              onProgress?.({ done, total: files.length });
+              continue;
+            }
+            await pipeline(
+              fs.createReadStream(file.path),
+              cacache.put.stream(cachePath, integrity, { integrity }),
+            );
+          } else {
+            await pipeline(
+              fs.createReadStream(file.path),
+              cacache.put.stream(cachePath, `dsh-tarball:${path.basename(file.path)}`),
+            );
+          }
+        } catch (error) {
+          write(`update: 写入 npm 缓存失败（${path.basename(file.path)}）：${error.message}`);
+        }
+      } else {
+        const result = await run(nodeExe, [npmCli, 'cache', 'add', file.path, '--loglevel=error'], {
+          env: npmEnv(null),
+          timeoutMs: PROBE_TIMEOUT_MS * 5,
+        });
+        if (result.code !== 0) {
+          const detail = result.stderr.trim().split(/\r?\n/).slice(-2).join(' ');
+          write(`update: npm cache add 失败（${path.basename(file.path)}）：${detail}`);
+        }
+      }
+      done += 1;
+      onProgress?.({ done, total: files.length });
+    }
+    return done;
+  }
+
+  /** npm ships cacache; using it directly avoids one process per tarball. */
+  function loadCacache() {
+    const candidate = path.join(
+      bundledRuntimeDir,
+      'node',
+      'node_modules',
+      'npm',
+      'node_modules',
+      'cacache',
+    );
+    try {
+      return fs.existsSync(candidate) ? require(candidate) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Install `version` into the runtime store and switch to it.
+   *
+   * The download is ours (resumable, mirror-failover, real progress); npm only
+   * resolves the tree and then installs offline from the cache we filled.
+   *
+   * @param {string} version
+   * @param {object} [options]
+   * @param {string} [options.registryId]  mirror id; default is the saved one
+   * @param {(progress: object) => void} [options.onProgress]
+   * @param {object} [options.controller]  from `createUpdateController()`
+   */
+  async function install(version, { registryId, onProgress = () => {}, controller, log: logLine } = {}) {
     assertBundledNpm();
     if (parseVersion(version) === null) throw new Error(`not a version: ${version}`);
+    const write = typeof logLine === 'function' ? logLine : log;
 
     const target = installedRoot(version);
     const existing = inspect(target);
     if (existing !== null) {
-      onProgress({ phase: 'activate', version });
+      onProgress({ phase: 'activate', version, reused: true });
       activate(version);
       return { version, root: target, reused: true };
     }
+
+    const mirror = mirrorFor(registryId);
+    // Every other mirror, as a retry target for an individual tarball.
+    const otherBases = MIRRORS.map((entry) => entry.url).filter(
+      (url) => typeof url === 'string' && url !== mirror.url,
+    );
 
     fs.mkdirSync(runtimesDir, { recursive: true });
     cleanStaging();
@@ -351,54 +553,189 @@ function createRuntimeManager({ bundledRuntimeDir, userDataDir, log }) {
       'utf8',
     );
 
-    onProgress({ phase: 'download', version });
-    log(`installing ${DSH_PACKAGE}@${version} into ${staging}`);
-    const result = await run(
-      nodeExe,
-      [
-        npmCli,
-        'install',
-        '--omit=dev',
-        // Native dependencies ship prebuilt binaries inside their tarballs, so
-        // no lifecycle scripts are needed — and skipping them keeps the install
-        // independent of any build toolchain on the user's machine.
-        '--ignore-scripts',
-        '--no-audit',
-        '--no-fund',
-        '--loglevel=error',
-      ],
-      { cwd: staging, env: npmEnv(), timeoutMs: INSTALL_TIMEOUT_MS },
-    );
-
-    if (result.code !== 0) {
-      rmTree(staging);
-      const detail = result.stderr.trim().split(/\r?\n/).slice(-4).join(' ');
-      throw new Error(`npm install failed (${result.code}): ${detail}`);
-    }
-
-    onProgress({ phase: 'verify', version });
-    const staged = inspect(staging);
-    if (staged === null) {
-      rmTree(staging);
-      throw new Error(
-        `the installed tree failed validation (missing entry point, Web assets, or mismatched family versions)`,
+    try {
+      onProgress({ phase: 'resolve', version, registryId: mirror.id, registry: mirror.url });
+      write(
+        `update: 解析 ${DSH_PACKAGE}@${version} 的依赖树（registry=${mirror.url ?? '~/.npmrc'}）`,
       );
+      const entries = await resolveTree(staging, mirror.url, { write, controller });
+      write(`update: 需要下载 ${entries.length} 个 tarball`);
+
+      onProgress({ phase: 'plan', version, total: entries.length, planned: 0, totalBytes: 0, unknown: 0 });
+      await planSizes(entries, {
+        controller,
+        log: write,
+        onProgress: (progress) => onProgress({ phase: 'plan', version, ...progress }),
+      });
+
+      const downloaded = await downloadAll(entries, {
+        dir: tarballsDir,
+        controller,
+        log: write,
+        fallbackUrls: otherBases,
+        onProgress: (progress) => onProgress({ phase: 'download', version, ...progress }),
+      });
+      write(
+        `update: 下载完成 ${downloaded.files} 个包 / ${formatBytes(downloaded.bytes)} / ${formatDuration(downloaded.seconds)}`,
+      );
+
+      onProgress({ phase: 'seed', version, done: 0, total: entries.length });
+      await seedCache(
+        entries.map((entry) => ({
+          path: path.join(tarballsDir, fileNameFor(entry)),
+          integrity: entry.integrity,
+        })),
+        { write, controller, onProgress: ({ done, total }) => onProgress({ phase: 'seed', version, done, total }) },
+      );
+
+      onProgress({ phase: 'install', version });
+      write(`update: 从本地缓存安装到 ${staging}`);
+      const installed = await run(
+        nodeExe,
+        [
+          npmCli,
+          'install',
+          '--omit=dev',
+          // Native dependencies ship prebuilt binaries inside their tarballs, so
+          // no lifecycle scripts are needed — and skipping them keeps the install
+          // independent of any build toolchain on the user's machine.
+          '--ignore-scripts',
+          '--no-audit',
+          '--no-fund',
+          // Cache-first: everything was just downloaded, so this normally means
+          // "no network at all"; it still falls back to the registry for a
+          // platform-specific optional package we chose not to pre-fetch.
+          '--prefer-offline',
+          '--loglevel=error',
+        ],
+        { cwd: staging, env: npmEnv(mirror.url), timeoutMs: INSTALL_TIMEOUT_MS },
+      );
+      if (installed.code !== 0) {
+        const detail = installed.stderr.trim().split(/\r?\n/).slice(-4).join(' ');
+        throw new Error(`npm install failed (${installed.code}): ${detail}`);
+      }
+      controller?.throwIfCancelled();
+
+      onProgress({ phase: 'verify', version });
+      const staged = inspect(staging);
+      if (staged === null) {
+        throw new Error(
+          `the installed tree failed validation (missing entry point, Web assets, or mismatched family versions)`,
+        );
+      }
+
+      onProgress({ phase: 'activate', version });
+      rmTree(target);
+      fs.renameSync(staging, target);
+      activate(version);
+      pruneTarballs();
+
+      // Report the Node the interpreter will use, so an engines bump that needs a
+      // newer Node is visible in the log rather than only as a later boot failure.
+      const engines = readJson(path.join(target, 'node_modules', DSH_PACKAGE, 'package.json'))?.engines;
+      if (engines?.node !== undefined) {
+        write(
+          `runtime ${version} declares engines.node=${engines.node}; bundled interpreter is ${process.version}`,
+        );
+      }
+
+      write(`activated runtime ${version}`);
+      return { version, root: target, reused: false };
+    } catch (error) {
+      // The staging tree is unusable either way; the downloaded tarballs are
+      // deliberately kept, so cancelling and retrying resumes instead of
+      // starting over.
+      rmTree(staging);
+      throw error;
     }
+  }
 
-    onProgress({ phase: 'activate', version });
-    rmTree(target);
-    fs.renameSync(staging, target);
-    activate(version);
-
-    // Report the Node the interpreter will use, so an engines bump that needs a
-    // newer Node is visible in the log rather than only as a later boot failure.
-    const engines = readJson(path.join(target, 'node_modules', DSH_PACKAGE, 'package.json'))?.engines;
-    if (engines?.node !== undefined) {
-      log(`runtime ${version} declares engines.node=${engines.node}; bundled interpreter is ${process.version}`);
+  /** Drop tarballs from updates nobody will resume any more. */
+  function pruneTarballs() {
+    if (!fs.existsSync(tarballsDir)) return;
+    const now = Date.now();
+    for (const entry of fs.readdirSync(tarballsDir)) {
+      const file = path.join(tarballsDir, entry);
+      try {
+        if (now - fs.statSync(file).mtimeMs > TARBALL_TTL_MS) fs.rmSync(file, { force: true });
+      } catch {
+        /* a file we cannot inspect is not worth failing the install for */
+      }
     }
+  }
 
-    log(`activated runtime ${version}`);
-    return { version, root: target, reused: false };
+  /**
+   * Probe every mirror and report latency and throughput.
+   * The packument is the first thing an update check fetches, so timing it is
+   * the closest thing to timing the update itself — and it is small enough to
+   * repeat on all mirrors in parallel.
+   */
+  async function testMirrors({ timeoutMs = 20000, capBytes = 2 * 1024 * 1024 } = {}) {
+    const targets = MIRRORS.filter((mirror) => typeof mirror.url === 'string');
+    const results = await Promise.all(
+      targets.map(async (mirror) => {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), timeoutMs);
+        const started = Date.now();
+        let firstByteAt = null;
+        let bytes = 0;
+        try {
+          const response = await fetch(`${mirror.url}${DSH_PACKAGE.replace('/', '%2f')}`, {
+            headers: { 'user-agent': 'dsh-desktop-update/1.0', 'accept-encoding': 'identity' },
+            signal: controller.signal,
+          });
+          firstByteAt = Date.now();
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          for await (const chunk of response.body) {
+            bytes += chunk.length;
+            if (bytes >= capBytes) break;
+          }
+        } catch (error) {
+          return {
+            id: mirror.id,
+            label: mirror.label,
+            url: mirror.url,
+            ok: false,
+            error: error.name === 'AbortError' ? '超时' : error.message,
+          };
+        } finally {
+          clearTimeout(timer);
+        }
+        const elapsed = Math.max(1, Date.now() - started) / 1000;
+        return {
+          id: mirror.id,
+          label: mirror.label,
+          url: mirror.url,
+          ok: true,
+          latencyMs: firstByteAt === null ? null : firstByteAt - started,
+          bytes,
+          bytesPerSecond: bytes / elapsed,
+          elapsedMs: Date.now() - started,
+        };
+      }),
+    );
+    return results.sort((a, b) => {
+      if (a.ok !== b.ok) return a.ok ? -1 : 1;
+      return (b.bytesPerSecond ?? 0) - (a.bytesPerSecond ?? 0);
+    });
+  }
+
+  /** Whether a lockfile entry's `os`/`cpu` guards allow it on this machine. */
+  function matchesPlatform(meta) {
+    const check = (list, actual) => {
+      if (!Array.isArray(list) || list.length === 0) return true;
+      let allowed = false;
+      for (const raw of list) {
+        if (typeof raw !== 'string') continue;
+        const negated = raw.startsWith('!');
+        const value = negated ? raw.slice(1) : raw;
+        if (value !== actual) continue;
+        if (negated) return false;
+        allowed = true;
+      }
+      return allowed;
+    };
+    return check(meta.os, process.platform) && check(meta.cpu, process.arch);
   }
 
   /** Point the shell at `version`, remembering what to fall back to. */
@@ -493,14 +830,38 @@ function createRuntimeManager({ bundledRuntimeDir, userDataDir, log }) {
     };
   }
 
+  /** Persist the chosen mirror (used by the menu's 更新镜像源 submenu). */
+  function setMirror(registryId) {
+    const mirror = mirrorFor(registryId);
+    writeState({ registryId: mirror.id });
+    return mirror;
+  }
+
   return {
     CHANNELS,
-    paths: { bundledRuntimeDir, bundledAppDir, nodeExe, npmCli, runtimesDir, cacheDir, stateFile },
+    MIRRORS,
+    DEFAULT_MIRROR_ID,
+    paths: {
+      bundledRuntimeDir,
+      bundledAppDir,
+      nodeExe,
+      npmCli,
+      runtimesDir,
+      cacheDir,
+      updateCacheDir,
+      tarballsDir,
+      stateFile,
+    },
     readState,
     writeState,
+    mirrorFor,
+    registryUrlFor,
+    setMirror,
     resolve,
     check,
     install,
+    testMirrors,
+    pruneTarballs,
     activate,
     rollback,
     noteBootSuccess,
@@ -511,4 +872,13 @@ function createRuntimeManager({ bundledRuntimeDir, userDataDir, log }) {
   };
 }
 
-module.exports = { createRuntimeManager, compareVersions, CHANNELS, DEFAULT_CHANNEL, BOOT_FAILURE_LIMIT };
+module.exports = {
+  createRuntimeManager,
+  compareVersions,
+  CHANNELS,
+  DEFAULT_CHANNEL,
+  MIRRORS,
+  DEFAULT_MIRROR_ID,
+  BOOT_FAILURE_LIMIT,
+  UpdateCancelledError,
+};

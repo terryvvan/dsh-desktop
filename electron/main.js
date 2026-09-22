@@ -23,6 +23,8 @@ const { createRuntimeManager } = require('./updater');
 const { createBackgroundManager } = require('./background');
 const { createDesktopMenu, buildMenuData, toTemplate } = require('./desktop-menu');
 const { createProfileGuard } = require('./profile-guard');
+const { createUpdateWindow } = require('./update-window');
+const { createUpdateController, UpdateCancelledError, formatBytes } = require('./tarball-cache');
 
 const APP_ID = 'ai.deepseek.harness.desktop';
 const APP_TITLE = 'DeepSeek Harness';
@@ -61,6 +63,12 @@ let bootTimer = null;
 let quitting = false;
 let restarting = false;
 let installing = false;
+/** The in-flight install's pause/cancel controller, or null when idle. */
+let updateController = null;
+/** Version the in-flight (or last) install targets, for retry from the window. */
+let updateTargetVersion = null;
+/** True while a user-triggered update check is in flight; drives menu feedback. */
+let manualCheckRunning = false;
 let startupCheckStarted = false;
 /**
  * Config recovery stages already tried for the current failure streak: 0 = none,
@@ -156,6 +164,41 @@ const profileGuard = createProfileGuard({
 // Privileged schemes have to be declared before the app is ready, which is why
 // this cannot wait for the manager to be installed below.
 backgroundManager.registerScheme();
+
+/**
+ * The update progress window.
+ *
+ * One instance for the whole app run: the window outlives any single install
+ * (closing it does not cancel), so it owns the job's visible state. Every
+ * handler below is only ever called from that window's own preload.
+ */
+const updateWindow = createUpdateWindow({
+  getMainWindow: () => mainWindow,
+  log,
+  handlers: {
+    pause: () => {
+      updateController?.pause();
+      updateWindow.patch({ paused: true });
+    },
+    resume: () => {
+      updateController?.resume();
+      updateWindow.patch({ paused: false });
+    },
+    cancel: () => updateController?.cancel(),
+    retry: () => {
+      if (updateTargetVersion !== null) void runInstall(updateTargetVersion);
+    },
+    restart: () => {
+      updateWindow.close();
+      void restartRuntime();
+    },
+    mirror: (id) => setMirror(id),
+    speedtest: () => void runMirrorSpeedTest(),
+    'open-log': () => void shell.openPath(logDir),
+    close: () => updateWindow.close(),
+    closed: () => buildMenu(),
+  },
+});
 
 // ─── window state ────────────────────────────────────────────────────────────
 
@@ -839,64 +882,176 @@ function maybeAutoCheck() {
 }
 
 function promptInstall(result) {
+  const mirror = runtimeManager.mirrorFor(result.registryId);
   const choice = dialog.showMessageBoxSync(mainWindow ?? undefined, {
     type: 'info',
     title: `${APP_TITLE} — 发现新版本`,
     message: `DSH ${result.latest} 可用（当前 ${result.current}）`,
     detail:
-      `更新通道：${result.channel}\n\n` +
+      `更新通道：${result.channel}\n` +
+      `下载镜像：${mirror.label}${mirror.url === null ? '' : `（${mirror.url}）`}\n\n` +
       '更新会在后台下载并安装到当前用户目录，不需要重新安装应用，也不会打断正在进行的会话。' +
-      '安装完成后重启内核即可生效；如果新版本启动失败，会自动回退。',
+      '下载时可以看到进度、速度与剩余时间，也可以暂停、取消或换镜像；安装完成后重启内核即可生效，' +
+      '如果新版本启动失败，会自动回退。',
     buttons: ['下载并安装', '稍后', '忽略此版本'],
     defaultId: 0,
     cancelId: 1,
   });
-  if (choice === 0) void runInstall(result.latest);
+  if (choice === 0) void runInstall(result.latest, { registryId: result.registryId });
   else if (choice === 2) runtimeManager.writeState({ skippedVersion: result.latest });
 }
 
-async function runInstall(version) {
-  if (installing) return;
+/** Mirror records as the update window needs them: labels, never URLs. */
+function mirrorChoices() {
+  return runtimeManager.MIRRORS.map(({ id, label, hint }) => ({ id, label, hint }));
+}
+
+/** Open (or focus) the update window, seeded with what it needs to render. */
+function openUpdateProgress(info = {}) {
+  const registryId = info.registryId ?? runtimeManager.readState().registryId;
+  updateWindow.open({
+    ...info,
+    version: info.version ?? updateTargetVersion,
+    channel: info.channel ?? runtimeManager.readState().channel,
+    registryId,
+    registry: runtimeManager.mirrorFor(registryId).url,
+    mirrors: mirrorChoices(),
+  });
+}
+
+/** Switch the registry used by both the update check and the download. */
+async function setMirror(id) {
+  const mirror = runtimeManager.setMirror(id);
+  log(
+    `update mirror set to ${mirror.id}${mirror.url === null ? ' (follow ~/.npmrc)' : ` (${mirror.url})`}`,
+  );
+  buildMenu();
+  updateWindow.patch({ registryId: mirror.id, registry: mirror.url, mirrors: mirrorChoices() });
+  return mirror;
+}
+
+/** Time every mirror and report the result into the update window. */
+async function runMirrorSpeedTest() {
+  if (updateWindow.snapshot().speedTest?.running === true) return;
+  updateWindow.patch({ speedTest: { running: true } });
+  log('update: mirror speed test started');
+  try {
+    const results = await runtimeManager.testMirrors();
+    const recommended = results.find((entry) => entry.ok === true)?.id ?? null;
+    const summary = results
+      .map((entry) =>
+        entry.ok === true
+          ? `${entry.id}=${Math.round(entry.latencyMs ?? 0)}ms/${Math.round((entry.bytesPerSecond ?? 0) / 1024)}KBps`
+          : `${entry.id}=failed(${entry.error})`,
+      )
+      .join(' ');
+    log(`update: mirror speed test: ${summary}`);
+    updateWindow.patch({ speedTest: { running: false, results, recommended } });
+  } catch (error) {
+    log(`update: mirror speed test failed: ${error.message}`);
+    updateWindow.patch({ speedTest: { running: false, results: [], error: error.message } });
+  }
+}
+
+/**
+ * Download and install `version`.
+ *
+ * The download is ours (`electron/tarball-cache.js`) so it can report real
+ * progress, pause, cancel and resume; npm only resolves the dependency tree and
+ * then installs offline from the cache we filled. A failure or a cancel keeps
+ * the downloaded tarballs, so 「重试」 continues instead of starting over.
+ */
+async function runInstall(version, { registryId } = {}) {
+  if (installing) {
+    log('update: install already running, ignoring request');
+    openUpdateProgress({ version, registryId });
+    return;
+  }
   installing = true;
-  setTaskbarProgress(2); // indeterminate
+  updateTargetVersion = version;
+  const mirror = runtimeManager.mirrorFor(registryId);
+  const controller = createUpdateController();
+  updateController = controller;
+  updateWindow.begin({
+    version,
+    channel: runtimeManager.readState().channel,
+    registryId: mirror.id,
+    registry: mirror.url,
+    mirrors: mirrorChoices(),
+  });
+  openUpdateProgress({ version, registryId: mirror.id });
+  log(`update: start ${version} (registry=${mirror.url ?? '~/.npmrc'})`);
+  // Indeterminate until the first byte counts arrive; the downloader reports
+  // real progress a moment later.
+  setTaskbarProgress(2);
+  buildMenu();
+
+  let downloadedBytes = 0;
   try {
     const result = await runtimeManager.install(version, {
-      onProgress: ({ phase }) => log(`update: ${phase} ${version}`),
+      registryId: mirror.id,
+      controller,
+      log: (line) => {
+        log(line);
+        updateWindow.appendLog(line);
+      },
+      onProgress: (progress) => {
+        updateWindow.progress(progress);
+        if (progress.phase === 'download' && Number.isFinite(progress.bytes)) {
+          downloadedBytes = progress.bytes;
+        }
+        if (progress.phase === 'download' && Number.isFinite(progress.percent)) {
+          setTaskbarProgress(Math.max(0, Math.min(1, progress.percent / 100)));
+        } else if (progress.phase === 'seed' || progress.phase === 'install') {
+          setTaskbarProgress(2);
+        }
+      },
     });
+
     runtimeManager.prune();
     log(`update installed: ${version}${result.reused ? ' (already present)' : ''}`);
     setTaskbarProgress(-1);
-
-    const activated = runtimeManager.readState().activeVersion === version;
-    const choice = dialog.showMessageBoxSync(mainWindow ?? undefined, {
-      type: 'info',
-      title: `${APP_TITLE} — 更新已就绪`,
-      message: `DSH ${version} 已安装`,
-      detail: activated
-        ? '重启内核后生效。正在运行的会话会被中断。'
-        : `已安装到磁盘，但当前仍在使用 ${runtimeManager.describe().active}。`,
-      buttons: activated ? ['立即重启内核', '稍后'] : ['好的'],
-      defaultId: 0,
-      cancelId: 1,
-    });
-    if (activated && choice === 0) void restartRuntime();
-  } catch (error) {
-    log(`update failed: ${error.message}`);
-    setTaskbarProgress(-1);
-    dialog.showErrorBox(
-      `${APP_TITLE} — 更新失败`,
-      `${error.message}\n\n当前仍在运行原有运行时，未做任何改动。\n日志：${logFile}`,
+    updateWindow.appendLog(
+      `安装完成：DSH ${version} 已就绪${result.reused ? '（本地已存在，直接切换）' : `（本次下载 ${formatBytes(downloadedBytes)}）`}`,
     );
+    updateWindow.finish();
+    buildMenu();
+  } catch (error) {
+    setTaskbarProgress(-1);
+    if (error instanceof UpdateCancelledError) {
+      log(`update cancelled: ${version}`);
+      updateWindow.markCancelled();
+    } else {
+      log(`update failed: ${error.message}`);
+      updateWindow.fail(
+        `${error.message}\n当前仍在运行原有运行时，未做任何改动。\n日志：${logFile}`,
+      );
+    }
+    buildMenu();
   } finally {
     installing = false;
+    updateController = null;
   }
 }
 
 async function manualCheck() {
-  const item = Menu.getApplicationMenu()?.getMenuItemById('check-updates');
-  if (item !== undefined) item.enabled = false;
+  if (manualCheckRunning) {
+    log('manual check: already running, ignoring request');
+    return;
+  }
+  manualCheckRunning = true;
+  // The probe below can take up to PROBE_TIMEOUT_MS (60s) before anything is
+  // shown, so react immediately: both menu bars say "正在检查更新…" and stop
+  // accepting clicks, and the taskbar gets an indeterminate progress bar.
+  setTaskbarProgress(2);
+  buildMenu();
+  log('manual check: start');
   try {
     const result = await runtimeManager.check({});
+    log(
+      `manual check: channel=${result.channel} current=${result.current} ` +
+        `latest=${result.latest} available=${result.updateAvailable}`,
+    );
     if (result.updateAvailable) {
       promptInstall(result);
       return;
@@ -915,12 +1070,16 @@ async function manualCheck() {
       buttons: ['好的'],
     });
   } catch (error) {
+    log(`manual check failed: ${error.message}`);
     dialog.showErrorBox(
       `${APP_TITLE} — 检查更新失败`,
       `${error.message}\n\n如果这台机器访问不到公共 registry，请在 ~/.npmrc 里配置可用的镜像后再试。`,
     );
   } finally {
-    if (item !== undefined) item.enabled = true;
+    manualCheckRunning = false;
+    // A started install owns the progress bar from here on.
+    if (!installing) setTaskbarProgress(-1);
+    buildMenu();
   }
 }
 
@@ -986,6 +1145,13 @@ function menuContext() {
     setChannel,
     manualProfileRollback,
     manualCheck,
+    isCheckingUpdate: () => manualCheckRunning,
+    isUpdating: () => installing,
+    mirrors: () => runtimeManager.MIRRORS,
+    registryId: () => runtimeManager.readState().registryId,
+    setMirror,
+    testMirrors: () => void runMirrorSpeedTest(),
+    showUpdateProgress: () => openUpdateProgress(),
     doRollback,
     showAbout,
     rebuildMenu: () => buildMenu(),
@@ -1015,6 +1181,7 @@ function buildMenu() {
 /** The About box, kept out of the menu definition so it stays readable. */
 function showAbout() {
   const info = runtimeManager.describe();
+  const mirror = runtimeManager.mirrorFor();
   dialog.showMessageBox(mainWindow ?? undefined, {
     type: 'info',
     title: `关于 ${APP_TITLE}`,
@@ -1024,6 +1191,7 @@ function showAbout() {
       `当前 DSH ${info.active ?? '未知'}（${info.source === 'bundled' ? '内置运行时' : '已安装更新'}）\n` +
       `内置 DSH ${info.bundled ?? '未知'}\n` +
       `更新通道 ${info.channel}${info.previous === null ? '' : ` · 上一版本 ${info.previous}`}\n` +
+      `下载镜像 ${mirror.label}${mirror.url === null ? '' : `（${mirror.url}）`}\n` +
       `已安装版本 ${info.installed.length === 0 ? '（无）' : info.installed.join(', ')}\n` +
       `上次检查 ${info.lastCheck ?? '从未'}\n\n` +
       `配置目录 ${dshHome()}\n` +

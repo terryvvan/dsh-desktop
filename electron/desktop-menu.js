@@ -68,6 +68,13 @@ function buildMenuData(context) {
     setChannel,
     manualProfileRollback,
     manualCheck,
+    isCheckingUpdate,
+    isUpdating,
+    mirrors,
+    registryId,
+    setMirror,
+    testMirrors,
+    showUpdateProgress,
     doRollback,
     showAbout,
     rebuildMenu,
@@ -89,7 +96,20 @@ function buildMenuData(context) {
       enabled: () => profileGuard.hasSnapshot(),
       run: () => void manualProfileRollback(),
     },
-    'manual-update': { label: '检查更新…', run: () => void manualCheck() },
+    'manual-update': {
+      label: () => (isCheckingUpdate() ? '正在检查更新…' : '检查更新…'),
+      enabled: () => !isCheckingUpdate(),
+      run: () => void manualCheck(),
+    },
+    'update-progress': {
+      label: () => (isUpdating() ? '更新进度（下载中…）' : '更新进度…'),
+      run: () => showUpdateProgress(),
+    },
+    'mirror-speed-test': {
+      label: () => (isUpdating() ? '测速并推荐最快镜像（下载中不可用）' : '测速并推荐最快镜像…'),
+      enabled: () => !isUpdating(),
+      run: () => void testMirrors(),
+    },
     rollback: {
       label: () => {
         const previous = runtimeManager.describe().previous;
@@ -151,12 +171,36 @@ function buildMenuData(context) {
   };
 
   const described = runtimeManager.describe();
+  // The page draws channel rows like any other item, so a click arrives here as
+  // `run channel:<name>`. Register them as real commands, otherwise the bridge
+  // reports `unknown command: channel:<name>` and nothing happens.
+  for (const name of runtimeManager.CHANNELS) {
+    commands[`channel:${name}`] = { run: () => void setChannel(name) };
+  }
   const channels = runtimeManager.CHANNELS.map((name) => ({
     id: `channel:${name}`,
     label:
       name === 'next' ? 'next（稳态预发布）' : name === 'alpha' ? 'alpha（跟随 master）' : 'latest',
     checked: described.channel === name,
   }));
+
+  // Mirrors are rows for the same reason channels are: the page draws them as
+  // ordinary items, so a click arrives as `run mirror:<id>` and has to map onto
+  // a registered command.
+  const allMirrors = mirrors();
+  for (const mirror of allMirrors) {
+    commands[`mirror:${mirror.id}`] = { run: () => void setMirror(mirror.id) };
+  }
+  const currentMirror = runtimeManager.mirrorFor(registryId());
+  const mirrorItems = allMirrors.map((mirror) => ({
+    id: `mirror:${mirror.id}`,
+    label:
+      mirror.url === null
+        ? mirror.label
+        : `${mirror.label}（${mirror.url.replace(/^https?:\/\//, '').replace(/\/$/, '')}）`,
+    checked: mirror.id === currentMirror.id,
+  }));
+  mirrorItems.push({ separator: true }, at('mirror-speed-test'));
 
   const data = [
     {
@@ -175,6 +219,8 @@ function buildMenuData(context) {
         at('rollback-profile'),
         { separator: true },
         at('manual-update'),
+        at('update-progress'),
+        { label: `更新镜像源（${currentMirror.label}）`, items: mirrorItems },
         { label: '更新通道', items: channels },
         at('rollback'),
         at('use-bundled'),
@@ -238,7 +284,9 @@ function toTemplate(data, commands) {
       if (item.items !== undefined) {
         return {
           label: item.label,
-          submenu: item.id === undefined ? item.items.filter((entry) => entry.info !== true) : item.items,
+          // Nested levels (e.g. the update channels) need the same conversion,
+          // otherwise their entries reach Electron as raw data with no click.
+          submenu: convert(item.id === undefined ? item.items.filter((entry) => entry.info !== true) : item.items),
         };
       }
       const command = commands[item.id];
@@ -247,6 +295,7 @@ function toTemplate(data, commands) {
         id: item.id,
         enabled: item.enabled,
         accelerator: command?.accelerator,
+        ...(item.checked === undefined ? {} : { type: 'radio', checked: item.checked }),
         ...(command?.role === undefined ? { click: () => command?.run?.() } : { role: command.role }),
       };
     });
@@ -336,12 +385,18 @@ function drawFunction(data) {
         color: var(--dshbg-menu-fg);
         font: 12.5px/1.5 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
       }
-      /* A submenu is positioned against the panel it hangs from. */
+      /* A submenu hangs off its own row, not off the panel: the row is its parent
+         so that moving the pointer onto the submenu does not read as leaving the
+         row, and the row is positioned so that 'left: 100%' means the panel's
+         right edge rather than the panel's own left edge. Where it actually lands
+         is measured in placeSubmenu below; this rule only has to be a sane
+         starting point for that measurement. */
       #${BAR_ID} .panel .panel {
         position: absolute; top: -6px; left: 100%;
         -webkit-backdrop-filter: blur(18px); backdrop-filter: blur(18px);
       }
       #${BAR_ID} .item {
+        position: relative;
         display: flex; align-items: center; gap: 10px;
         padding: 5px 10px; border-radius: 5px; cursor: default; white-space: nowrap;
       }
@@ -362,6 +417,43 @@ function drawFunction(data) {
   let open = null;
   const close = () => {
     if (open !== null) { open.panel.remove(); open.item.classList.remove('open'); open = null; }
+  };
+
+  /**
+   * Put a submenu beside the row it was opened from.
+   *
+   * The position is measured, not inherited from CSS. Two things decide where an
+   * absolutely positioned box lands — which ancestor counts as its containing
+   * block, and which edge 'left: 100%' is measured from — and both are easy to
+   * get wrong here: the panel carries a backdrop filter (which is itself a
+   * containing block for its descendants), and the top of the page belongs to the
+   * bar. So the box is first put at a known origin, its real position is read
+   * back, and it is moved by the difference; that lands it in the right place
+   * whichever ancestor the engine picked, and it is what keeps a submenu for a
+   * top-of-the-panel row from crossing the bar's bottom line.
+   */
+  const placeSubmenu = (sub, row, panel) => {
+    const rowRect = row.getBoundingClientRect();
+    const panelRect = panel.getBoundingClientRect();
+    sub.style.left = '0px';
+    sub.style.top = '0px';
+    const origin = sub.getBoundingClientRect();
+    const gap = 2;
+    // The bar is a fixed strip across the top of the page, so the floor for
+    // anything drawn in the page is the bar's bottom edge.
+    const floor = ${BAR_HEIGHT} + gap;
+    // Sit against the panel's right edge with a few pixels of overlap, so the
+    // pointer never has to cross a gap to reach the submenu.
+    let left = panelRect.right - 4;
+    if (left + origin.width > window.innerWidth - gap) left = panelRect.left - origin.width + 4;
+    left = Math.max(gap, left);
+    let top = rowRect.top - 6;
+    if (top < floor) top = floor;
+    if (top + origin.height > window.innerHeight - gap) {
+      top = Math.max(floor, window.innerHeight - gap - origin.height);
+    }
+    sub.style.left = Math.round(left - origin.left) + 'px';
+    sub.style.top = Math.round(top - origin.top) + 'px';
   };
 
   const buildPanel = (items) => {
@@ -399,16 +491,6 @@ function drawFunction(data) {
         arrow.className = 'arrow';
         arrow.textContent = '›';
         row.appendChild(arrow);
-        row.addEventListener('mouseenter', () => {
-          for (const other of panel.querySelectorAll(':scope > .panel')) other.remove();
-          const sub = buildPanel(item.items);
-          row.appendChild(sub);
-          const bounds = sub.getBoundingClientRect();
-          if (bounds.right > window.innerWidth) {
-            sub.style.left = 'auto';
-            sub.style.right = '100%';
-          }
-        });
       } else if (clickable) {
         row.addEventListener('click', (event) => {
           event.stopPropagation();
@@ -416,6 +498,21 @@ function drawFunction(data) {
           console.log(${JSON.stringify(CONSOLE_PREFIX)} + ' run ' + item.id);
         });
       }
+      // The row the pointer is on shows its own submenu and nothing else: a row
+      // with children builds one, a plain row leaves the panel bare. That is only
+      // safe because a submenu hangs off its own row — the pointer walks sideways
+      // from the row into the submenu, so no other row is in the way, and moving
+      // up off the row is meant to close it.
+      // Clearing has to match *all* descendants: a submenu is appended to its own
+      // row, not to the panel, so a ':scope > .panel' test never saw it and each
+      // hover in-and-out piled up one more floating panel.
+      row.addEventListener('mouseenter', () => {
+        for (const other of panel.querySelectorAll('.panel')) other.remove();
+        if (item.items === undefined) return;
+        const sub = buildPanel(item.items);
+        row.appendChild(sub);
+        placeSubmenu(sub, row, panel);
+      });
       panel.appendChild(row);
     }
     return panel;
@@ -493,24 +590,43 @@ function createDesktopMenu({ contents, getMenu, setChannel, log }) {
    */
   function installConsoleBridge() {
     contents.on('console-message', (...args) => {
-      // Electron changed this event's signature across versions; the log line is
-      // whichever argument is the message string.
-      const message = args.find(
-        (value) => typeof value === 'string' && value.startsWith(CONSOLE_PREFIX),
-      );
-      if (typeof message !== 'string') return;
-      const request = message.slice(CONSOLE_PREFIX.length).trim();
-      if (request === 'redraw') {
-        // The page noticed the bar was thrown away; draw it again.
-        refreshNow();
-        return;
+      try {
+        // Electron changed this event's signature across versions; the log line is
+        // whichever argument is the message string.
+        const message = args.find(
+          (value) => typeof value === 'string' && value.startsWith(CONSOLE_PREFIX),
+        );
+        if (typeof message !== 'string') return;
+        const request = message.slice(CONSOLE_PREFIX.length).trim();
+        if (request === 'redraw') {
+          // The page noticed the bar was thrown away; draw it again.
+          refreshNow();
+          return;
+        }
+        if (request.startsWith('run ')) {
+          const id = request.slice(4).trim();
+          const command = getMenu().commands[id];
+          if (command !== undefined && command.run !== undefined) {
+            // The click that reaches the shell must leave a trace in desktop.log:
+            // a swallowed command is otherwise indistinguishable from a click
+            // that never arrived.
+            log?.(`menu: run ${id}`);
+            command.run();
+          } else {
+            log?.(`menu: unknown command: ${id}`);
+          }
+          return;
+        }
+        if (request.startsWith('channel ')) {
+          log?.(`menu: ${request}`);
+          setChannel(request.slice(8).trim());
+          return;
+        }
+        log?.(`menu: ignored request: ${request}`);
+      } catch (error) {
+        // A throwing getMenu() must not look like a click that never arrived.
+        log?.(`menu: bridge failed: ${error && error.message}`);
       }
-      if (request.startsWith('run ')) {
-        const command = getMenu().commands[request.slice(4).trim()];
-        if (command !== undefined && command.run !== undefined) command.run();
-        return;
-      }
-      if (request.startsWith('channel ')) setChannel(request.slice(8).trim());
     });
   }
 
@@ -561,13 +677,13 @@ function createDesktopMenu({ contents, getMenu, setChannel, log }) {
    *   await it, which is what makes a failure visible in a test.
    */
   async function refreshNow() {
-    const menu = getMenu();
-    if (menu.pageMenu === false) {
-      await contents.executeJavaScript(removeScript(), true).catch(() => {});
-      return 'removed';
-    }
-    const script = `(() => { try { return (${drawFunction(menu.data)})(document); } catch (error) { return 'error: ' + (error && error.message); } })()`;
     try {
+      const menu = getMenu();
+      if (menu.pageMenu === false) {
+        await contents.executeJavaScript(removeScript(), true).catch(() => {});
+        return 'removed';
+      }
+      const script = `(() => { try { return (${drawFunction(menu.data)})(document); } catch (error) { return 'error: ' + (error && error.message); } })()`;
       const result = await contents.executeJavaScript(script, true);
       if (result !== 'ok' && result !== 'no-body') log?.(`menu: bar injection said ${result}`);
       // Arm the observer only once the bar is actually on the page, so it can
@@ -575,8 +691,10 @@ function createDesktopMenu({ contents, getMenu, setChannel, log }) {
       if (result === 'ok') await contents.executeJavaScript(watchScript(), true).catch(() => {});
       return result;
     } catch (error) {
-      log?.(`menu: bar injection failed: ${error.message}`);
-      return `error: ${error.message}`;
+      // `getMenu()` is part of the drawing: a throwing getter used to escape as an
+      // unhandled rejection, which left no trace anywhere.
+      log?.(`menu: bar injection failed: ${error && error.message}`);
+      return `error: ${error && error.message}`;
     }
   }
 
@@ -593,7 +711,7 @@ function createDesktopMenu({ contents, getMenu, setChannel, log }) {
       // is cheaper than reasoning about exactly when that is.
       for (const delay of [500, 1500, 3000, 6000]) {
         setTimeout(() => {
-          if (!contents.isDestroyed()) refreshNow();
+          if (!contents.isDestroyed()) void refreshNow().catch(() => {});
         }, delay);
       }
     },
